@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QGraphicsTextItem,QSlider,QLineEdit,
 )
 
-from pipeline import Sequence, Track, BlockInstance, BLOCKS, write_wav, ensure_stereo, AudioBuffer
+from pipeline import Sequence, Track, BlockInstance, BLOCKS, write_wav, ensure_stereo, AudioBuffer, MemoryBallast
 import sounds  # registers blocks
 import realism
 import melody_humanize
@@ -657,7 +657,8 @@ class MelodyGUI(QMainWindow):
         self._ui_timer = QTimer(self)
         self._ui_timer.setInterval(16)
         self._ui_timer.timeout.connect(self._tick_ui)
-
+        self._ballast = MemoryBallast()
+        self._ballast_target_mb = 0
         self.init_ui()
         self._apply_dark_daw_theme()
 
@@ -720,7 +721,22 @@ class MelodyGUI(QMainWindow):
         tbar.addWidget(self.btn_export)
 
         left_layout.addWidget(transport_box)
+        # ---- Memory (ballast) ----
+        mem_row = QHBoxLayout()
+        self.mem_spin = QSpinBox()
+        self.mem_spin.setRange(0, 8192)  # up to 8GB; adjust for your machine
+        self.mem_spin.setValue(0)
+        self.mem_spin.setFixedWidth(90)
+        self.mem_spin.valueChanged.connect(self.on_mem_ballast_changed)
 
+        self.mem_label = QLabel("RSS: ? MB")
+        mem_row.addWidget(QLabel("Warm RAM (MB)"))
+        mem_row.addWidget(self.mem_spin)
+        mem_row.addSpacing(10)
+        mem_row.addWidget(self.mem_label)
+        mem_row.addStretch(1)
+
+        left_layout.addLayout(mem_row)
         # Ghost scale
         ghost_box = QGroupBox("Ghost scale")
         ghost_row = QHBoxLayout(ghost_box)
@@ -1037,6 +1053,34 @@ class MelodyGUI(QMainWindow):
         self.clear_param_editor()
         self._mark_dirty_and_restart_from_playhead()
 
+    def on_mem_ballast_changed(self, mb: int):
+        # Safety: don't eat all RAM. Keep at least 512MB available.
+        try:
+            avail = self._ballast.avail_mb()
+            safe_max = max(0, avail - 512)
+            mb = int(max(0, min(int(mb), safe_max)))
+            if mb != self.mem_spin.value():
+                self.mem_spin.blockSignals(True)
+                self.mem_spin.setValue(mb)
+                self.mem_spin.blockSignals(False)
+
+            self._ballast_target_mb = mb
+            self._ballast.set_target_mb(mb, touch=True, chunk_mb=32)
+            self._update_mem_label()
+        except Exception:
+            # If allocation fails, back off
+            self._ballast.clear()
+            self._ballast_target_mb = 0
+            self._update_mem_label()
+
+    def _update_mem_label(self):
+        try:
+            rss = self._ballast.rss_mb()
+            held = self._ballast.held_mb()
+            avail = self._ballast.avail_mb()
+            self.mem_label.setText(f"RSS: {rss} MB | Ballast: {held} MB | Avail: {avail} MB")
+        except Exception:
+            self.mem_label.setText("RSS: ? MB")
     # ---------------- param editor ----------------
 
     def _clear_param_rows(self):
@@ -1517,6 +1561,7 @@ class MelodyGUI(QMainWindow):
             pos = int(self._play_pos)
         step_float = float(pos) / float(step_samples)
         self.roll.set_playhead_step(step_float)
+        self._update_mem_label()
 
     # ---------------- export ----------------
 

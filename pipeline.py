@@ -2,7 +2,8 @@ import wave
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
-
+import os
+import psutil
 
 # ----------------- Audio Buffer -----------------
 
@@ -420,3 +421,49 @@ class Sequence:
             mix += y
 
         return AudioBuffer(np.tanh(mix).astype(np.float32, copy=False), self.sr)
+
+class MemoryBallast:
+    """
+    Holds RAM on purpose so your process can keep hot working sets/caches.
+    NOTE: psutil only measures; the allocation below is what increases memory.
+    """
+    def __init__(self) -> None:
+        self._chunks: list[bytearray] = []
+        self._held_bytes: int = 0
+
+    def held_mb(self) -> int:
+        return int(self._held_bytes // (1024 * 1024))
+
+    def rss_mb(self) -> int:
+        p = psutil.Process(os.getpid())
+        return int(p.memory_info().rss // (1024 * 1024))
+
+    def avail_mb(self) -> int:
+        return int(psutil.virtual_memory().available // (1024 * 1024))
+
+    def set_target_mb(self, target_mb: int, *, touch: bool = True, chunk_mb: int = 32) -> None:
+        target_mb = max(0, int(target_mb))
+        target_bytes = target_mb * 1024 * 1024
+        chunk_bytes = max(1, int(chunk_mb)) * 1024 * 1024
+
+        # grow
+        while self._held_bytes < target_bytes:
+            need = target_bytes - self._held_bytes
+            alloc = min(chunk_bytes, need)
+            b = bytearray(alloc)
+            if touch:
+                # commit pages (Windows won't necessarily commit untouched pages)
+                page = 4096
+                for i in range(0, len(b), page):
+                    b[i] = 1
+            self._chunks.append(b)
+            self._held_bytes += alloc
+
+        # shrink
+        while self._held_bytes > target_bytes and self._chunks:
+            b = self._chunks.pop()
+            self._held_bytes -= len(b)
+
+    def clear(self) -> None:
+        self._chunks.clear()
+        self._held_bytes = 0
