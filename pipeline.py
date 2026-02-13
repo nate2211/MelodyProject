@@ -37,14 +37,20 @@ def write_wav(path: str, buf: AudioBuffer) -> None:
 class BaseBlock:
     """
     Block contract:
+
       - execute(payload, params=...) -> (payload_out, meta)
-      - Optional class attr: PARAMS (schema for GUI)
-      - Optional class attr: KIND ('instrument' or 'fx' or 'output')
+
+    Optional class attrs:
+      - PARAMS: Dict[str, Dict[str, Any]]   (schema for GUI)
+      - KIND: str  ('instrument' or 'fx' or 'output')
     """
+
+    # Override in subclasses (class attribute)
+    KIND: str = "fx"   # "instrument" | "fx" | "output"
+    PARAMS: Dict[str, Dict[str, Any]] = None  # type: ignore[assignment]
+
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
-        raise NotImplementedError
-
-
+        raise NotImplementedError(f"{self.__class__.__name__}.execute() not implemented")
 class Registry:
     def __init__(self) -> None:
         self._by_name: Dict[str, type[BaseBlock]] = {}
@@ -318,4 +324,99 @@ class Sequence:
 
         # Apply a final soft-clipper to the master mix to prevent harsh clipping
         # and give a more consistent output level.
+        return AudioBuffer(np.tanh(mix).astype(np.float32, copy=False), self.sr)
+
+    def render_from(self, start_sample: int, *, common: Dict[str, Any] | None = None) -> AudioBuffer:
+        """
+        Fast preview render:
+        Renders ONLY the audio region [start_sample : end] and returns that tail buffer.
+        Export should still use render() for full accuracy/stateful FX correctness.
+        """
+        common = common or {}
+        self.ensure()
+
+        step_s = self.step_seconds()
+        step_n = int(round(step_s * self.sr))
+        total_n = step_n * self.total_steps()
+
+        start_sample = int(max(0, min(total_n, int(start_sample))))
+        tail_n = total_n - start_sample
+
+        # If start is at end, return empty tail
+        if tail_n <= 0:
+            return AudioBuffer(np.zeros((0, 2), dtype=np.float32), self.sr)
+
+        mix = np.zeros((tail_n, 2), dtype=np.float32)
+
+        def place_tail(dst_tail: np.ndarray, src_note: np.ndarray, note_a: int, note_b: int):
+            """
+            Place overlap of src_note [0..dur) into dst_tail [0..tail_n),
+            but only for overlap with [start_sample..total_n).
+            """
+            a = max(note_a, start_sample)
+            b = min(note_b, total_n)
+            if b <= a:
+                return
+
+            # dst coordinates (tail starts at start_sample)
+            da = a - start_sample
+            db = b - start_sample
+
+            # src coordinates (note starts at note_a)
+            sa = a - note_a
+            sb = sa + (db - da)
+
+            dst_tail[da:db] += src_note[sa:sb]
+
+        for ti, track in enumerate(self.tracks):
+            if not track.instruments:
+                track.instruments = [BlockInstance("synth_keys", {})]
+
+            tbuf = np.zeros((tail_n, 2), dtype=np.float32)
+
+            for ev in self.notes[ti]:
+                note, octv = ev.pitch
+                freq = hz_from_note(note, octv)
+
+                dur_steps = max(1, int(ev.length_steps))
+                dur_s = dur_steps * step_s
+                dur_n = int(round(dur_s * self.sr))
+                if dur_n <= 0:
+                    continue
+
+                note_a = int(ev.start_step) * step_n
+                note_b = note_a + dur_n
+
+                # If note ends before tail region starts, skip
+                if note_b <= start_sample:
+                    continue
+
+                # Render this note (offline) then place only the overlapping part
+                layer = np.zeros((dur_n, 2), dtype=np.float32)
+
+                for inst in track.instruments:
+                    gen = BLOCKS.create(inst.name)
+                    payload = {"freq": freq, "duration": dur_s, "sr": self.sr}
+                    raw, _ = gen.execute(payload, params=dict(inst.params))
+                    y = ensure_stereo(raw.data)
+
+                    if y.shape[0] != dur_n:
+                        if y.shape[0] < dur_n:
+                            pad = np.zeros((dur_n, 2), dtype=np.float32)
+                            pad[:y.shape[0]] = y
+                            y = pad
+                        else:
+                            y = y[:dur_n]
+
+                    layer += y
+
+                place_tail(tbuf, layer, note_a, note_b)
+
+            # Apply FX to the tail (fast preview)
+            fx_chain = [(BLOCKS.create(bi.name), dict(bi.params)) for bi in track.fx]
+            out, _ = run_chain(AudioBuffer(tbuf, self.sr), fx_chain, common=common)
+            y = ensure_stereo(out.data) * float(track.volume)
+
+            mix += y
+
         return AudioBuffer(np.tanh(mix).astype(np.float32, copy=False), self.sr)
