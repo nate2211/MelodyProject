@@ -1135,12 +1135,14 @@ class MelodyGUI(QMainWindow):
             held = self._ballast.held_mb()
             avail = self._ballast.avail_mb()
 
-            cpu_p = self._cpu_ballast.cpu_pct_process()
-            # psutil returns process CPU usage which can exceed 100% on multi-core; clamp for display
-            cpu_disp = max(0.0, min(100.0, float(cpu_p)))
+            # raw can exceed 100 on multi-core
+            cpu_raw = float(self._cpu_ballast.cpu_pct_process_raw())
+            cpu_norm = float(self._cpu_ballast.cpu_pct_process_norm())  # 0..100 normalized to whole CPU
+            cores = int(self._cpu_ballast.cpu_count())
 
             self.mem_label.setText(
-                f"RSS: {rss} MB | Ballast: {held} MB | Avail: {avail} MB | CPU(proc): {cpu_disp:.1f}%"
+                f"RSS: {rss} MB | Ballast: {held} MB | Avail: {avail} MB | "
+                f"CPU(proc): {cpu_raw:.1f}% (raw) | {cpu_norm:.1f}% (norm/{cores} cores)"
             )
         except Exception:
             self.mem_label.setText("RSS: ? MB")

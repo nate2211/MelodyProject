@@ -6,6 +6,7 @@ import os
 import psutil
 import threading
 import time
+
 # ----------------- Audio Buffer -----------------
 
 @dataclass
@@ -124,17 +125,15 @@ class Track:
     volume: float = 1.0
 
 
+
+
+
 @dataclass
 class NoteEvent:
-    """
-    One note in the piano roll.
-    start_step: step index where note begins
-    length_steps: duration in steps (>=1)
-    pitch: (note, octave) like ("C#", 4)
-    """
-    start_step: int
-    length_steps: int
-    pitch: Tuple[str, int]
+    pitch: Tuple[str, int] = ("C", 4)
+    start_step: int = 0
+    length_steps: int = 1
+    velocity: float = 1.0
 
 
 @dataclass
@@ -471,113 +470,108 @@ class MemoryBallast:
 
 class CpuBallast:
     """
-    Burns CPU on purpose (a controllable "heater") to keep clocks/warm caches or test UI/audio stability.
+    Burns CPU by a controllable duty cycle.
+    Target is expressed as % of TOTAL CPU capacity (0..100),
+    not per-core.
 
-    target_pct is per-process target across all cores (approx).
-    Implementation: a set of worker threads run a simple duty-cycle loop:
-      - busy spin for on_time
-      - sleep for off_time
+    Example: on an 8-core CPU, target_pct=25 means ~2 cores loaded.
     """
+
     def __init__(self) -> None:
+        self._target_pct = 0
         self._stop = threading.Event()
-        self._target_pct: int = 0
         self._threads: list[threading.Thread] = []
         self._lock = threading.Lock()
 
-        # psutil process handle for measurements
         self._proc = psutil.Process(os.getpid())
-
-        # prime cpu_percent so future calls are non-blocking
+        # Prime cpu_percent so the first reading isn't always 0.0
         try:
-            self._proc.cpu_percent(interval=None)
+            self._proc.cpu_percent(None)
         except Exception:
             pass
 
-    def target_pct(self) -> int:
-        with self._lock:
-            return int(self._target_pct)
-
-    def cpu_pct_process(self) -> float:
-        """
-        Returns process CPU percent since last call (non-blocking).
-        Note: can exceed 100% on multi-core systems (psutil convention).
-        """
+    def cpu_count(self) -> int:
         try:
-            return float(self._proc.cpu_percent(interval=None))
+            return int(psutil.cpu_count(logical=True) or 1)
         except Exception:
-            return 0.0
+            return 1
 
     def set_target_pct(self, target_pct: int, *, workers: int | None = None) -> None:
         target_pct = int(max(0, min(100, int(target_pct))))
-
         with self._lock:
             self._target_pct = target_pct
 
         if target_pct <= 0:
-            self._ensure_workers(0)
-            return
-
-        # Default: a small number of workers so we don't overwhelm the scheduler.
-        # (More workers than cores can create extra jitter.)
-        if workers is None:
-            try:
-                cores = os.cpu_count() or 4
-            except Exception:
-                cores = 4
-            workers = max(1, min(4, cores))  # keep it sane
-        self._ensure_workers(int(workers))
-
-    def _ensure_workers(self, n: int) -> None:
-        n = int(max(0, n))
-
-        # stop all
-        if n == 0:
             self.stop()
             return
 
-        # already running with enough threads
-        if len(self._threads) == n and all(t.is_alive() for t in self._threads):
-            return
+        # start workers if not running
+        if not self._threads:
+            ncpu = self.cpu_count()
+            nworkers = int(workers) if workers is not None else ncpu
+            nworkers = max(1, min(nworkers, ncpu))
 
-        # restart with requested count
-        self.stop()
-        self._stop.clear()
-        self._threads = []
-        for i in range(n):
-            t = threading.Thread(target=self._worker_loop, name=f"CpuBallast-{i}", daemon=True)
-            self._threads.append(t)
-            t.start()
+            self._stop.clear()
+            self._threads = []
+            for _ in range(nworkers):
+                t = threading.Thread(target=self._worker_loop, daemon=True)
+                t.start()
+                self._threads.append(t)
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._threads.clear()
 
     def _worker_loop(self) -> None:
-        # Duty cycle window (shorter window = smoother response, more overhead)
-        window_s = 0.05  # 50ms
+        # small period -> smoother load
+        period = 0.10  # seconds
 
+        # Do NOT allocate in the loop; keep it tiny.
+        x = 0.0
         while not self._stop.is_set():
             with self._lock:
                 tgt = int(self._target_pct)
 
             if tgt <= 0:
-                time.sleep(0.1)
+                time.sleep(0.10)
                 continue
 
-            on = window_s * (tgt / 100.0)
-            off = max(0.0, window_s - on)
+            nworkers = max(1, len(self._threads) or 1)
 
-            # Busy section (spin)
-            t_end = time.perf_counter() + on
-            while (not self._stop.is_set()) and (time.perf_counter() < t_end):
-                # tiny arithmetic to prevent the loop from being optimized away
-                _ = 1234567 * 7654321
+            # convert "total CPU %" into per-worker share (still total-normalized)
+            # total capacity is 100%. Each worker approximates 100/nworkers of capacity
+            per_worker_pct = float(tgt) / float(nworkers)
+            on = period * (per_worker_pct / 100.0)
+            on = max(0.0, min(period, on))
+            off = period - on
 
-            # Sleep section
+            # busy part
+            t0 = time.perf_counter()
+            while (time.perf_counter() - t0) < on and not self._stop.is_set():
+                # tiny meaningless math to avoid optimizer shortcuts
+                x = (x * 1.0000001) + 0.0000001
+                if x > 1e9:
+                    x = 0.0
+
+            # sleep part (yields CPU)
             if off > 0:
                 time.sleep(off)
 
-    def stop(self) -> None:
-        self._stop.set()
-        for t in self._threads:
-            try:
-                t.join(timeout=0.2)
-            except Exception:
-                pass
-        self._threads = []
+    def cpu_pct_process_raw(self) -> float:
+        """
+        Raw process cpu_percent. Can exceed 100 on multi-core.
+        """
+        try:
+            return float(self._proc.cpu_percent(None))
+        except Exception:
+            return 0.0
+
+    def cpu_pct_process_norm(self) -> float:
+        """
+        Normalized to 0..100 for the whole machine.
+        """
+        raw = self.cpu_pct_process_raw()
+        n = float(self.cpu_count())
+        if n <= 0:
+            return raw
+        return max(0.0, min(100.0, raw / n))
