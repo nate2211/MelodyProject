@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QGraphicsTextItem,QSlider,QLineEdit,
 )
 
-from pipeline import Sequence, Track, BlockInstance, BLOCKS, write_wav, ensure_stereo, AudioBuffer, MemoryBallast
+from pipeline import Sequence, Track, BlockInstance, BLOCKS, write_wav, ensure_stereo, AudioBuffer, MemoryBallast, CpuBallast
 import sounds  # registers blocks
 import realism
 import melody_humanize
@@ -659,6 +659,16 @@ class MelodyGUI(QMainWindow):
         self._ui_timer.timeout.connect(self._tick_ui)
         self._ballast = MemoryBallast()
         self._ballast_target_mb = 0
+        self._cpu_ballast = CpuBallast()
+        self._cpu_ballast_target_pct = 0
+        # Debounce param-driven rerenders so UI doesn't hitch
+        self._dirty_timer = QTimer(self)
+        self._dirty_timer.setSingleShot(True)
+        self._dirty_timer.setInterval(60)  # 40-80ms feels good
+        self._dirty_timer.timeout.connect(self._apply_dirty_restart)
+
+        self._pending_dirty_restart = False
+
         self.init_ui()
         self._apply_dark_daw_theme()
 
@@ -722,17 +732,31 @@ class MelodyGUI(QMainWindow):
 
         left_layout.addWidget(transport_box)
         # ---- Memory (ballast) ----
+        # ---- Memory + CPU ballast (same row) ----
         mem_row = QHBoxLayout()
+
+        # RAM ballast
         self.mem_spin = QSpinBox()
-        self.mem_spin.setRange(0, 8192)  # up to 8GB; adjust for your machine
+        self.mem_spin.setRange(0, 8192)  # up to 8GB; adjust
         self.mem_spin.setValue(0)
         self.mem_spin.setFixedWidth(90)
         self.mem_spin.valueChanged.connect(self.on_mem_ballast_changed)
 
+        # CPU ballast
+        self.cpu_spin = QSpinBox()
+        self.cpu_spin.setRange(0, 100)  # %
+        self.cpu_spin.setValue(0)
+        self.cpu_spin.setFixedWidth(70)
+        self.cpu_spin.valueChanged.connect(self.on_cpu_ballast_changed)
+
         self.mem_label = QLabel("RSS: ? MB")
+
         mem_row.addWidget(QLabel("Warm RAM (MB)"))
         mem_row.addWidget(self.mem_spin)
-        mem_row.addSpacing(10)
+        mem_row.addSpacing(12)
+        mem_row.addWidget(QLabel("CPU ballast (%)"))
+        mem_row.addWidget(self.cpu_spin)
+        mem_row.addSpacing(12)
         mem_row.addWidget(self.mem_label)
         mem_row.addStretch(1)
 
@@ -942,6 +966,19 @@ class MelodyGUI(QMainWindow):
         self.roll.setStyleSheet("background: #111111; border: 1px solid #2f2f2f; border-radius: 10px;")
 
     # ---------------- core helpers ----------------
+    def _schedule_dirty_restart(self):
+        # Coalesce many param edits into one restart
+        self._render_dirty = True
+        self._pending_dirty_restart = True
+        if not self._dirty_timer.isActive():
+            self._dirty_timer.start()
+
+    def _apply_dirty_restart(self):
+        if not self._pending_dirty_restart:
+            return
+        self._pending_dirty_restart = False
+        with self._audio_lock:
+            self._play_pos = self._start_sample_for_current_locked()
 
     def _set_loop(self, on: bool):
         self._loop = bool(on)
@@ -1053,6 +1090,25 @@ class MelodyGUI(QMainWindow):
         self.clear_param_editor()
         self._mark_dirty_and_restart_from_playhead()
 
+    def on_cpu_ballast_changed(self, pct: int):
+        pct = int(max(0, min(100, int(pct))))
+        if pct != self.cpu_spin.value():
+            self.cpu_spin.blockSignals(True)
+            self.cpu_spin.setValue(pct)
+            self.cpu_spin.blockSignals(False)
+
+        self._cpu_ballast_target_pct = pct
+        try:
+            self._cpu_ballast.set_target_pct(pct)
+        except Exception:
+            # if anything goes wrong, fail safe
+            self._cpu_ballast.stop()
+            self._cpu_ballast_target_pct = 0
+            self.cpu_spin.blockSignals(True)
+            self.cpu_spin.setValue(0)
+            self.cpu_spin.blockSignals(False)
+
+        self._update_mem_label()
     def on_mem_ballast_changed(self, mb: int):
         # Safety: don't eat all RAM. Keep at least 512MB available.
         try:
@@ -1078,7 +1134,14 @@ class MelodyGUI(QMainWindow):
             rss = self._ballast.rss_mb()
             held = self._ballast.held_mb()
             avail = self._ballast.avail_mb()
-            self.mem_label.setText(f"RSS: {rss} MB | Ballast: {held} MB | Avail: {avail} MB")
+
+            cpu_p = self._cpu_ballast.cpu_pct_process()
+            # psutil returns process CPU usage which can exceed 100% on multi-core; clamp for display
+            cpu_disp = max(0.0, min(100.0, float(cpu_p)))
+
+            self.mem_label.setText(
+                f"RSS: {rss} MB | Ballast: {held} MB | Avail: {avail} MB | CPU(proc): {cpu_disp:.1f}%"
+            )
         except Exception:
             self.mem_label.setText("RSS: ? MB")
     # ---------------- param editor ----------------
@@ -1195,11 +1258,18 @@ class MelodyGUI(QMainWindow):
             cur_v = float(cur_v if cur_v is not None else (mn + mx) * 0.5)
             cur_v = float(np.clip(cur_v, mn, mx))
 
+            # block signals while we set defaults
+            sld.blockSignals(True)
+            spn.blockSignals(True)
+
             sld.setValue(_value_to_slider(cur_v, mn, step, steps_int))
             if is_int:
                 spn.setValue(int(round(cur_v)))
             else:
                 spn.setValue(cur_v)
+
+            sld.blockSignals(False)
+            spn.blockSignals(False)
 
             # wire: slider -> spin -> params
             def on_slider(val, k=key, slider=sld, spin=spn, mn_=mn, step_=step, is_int_=is_int):
@@ -1209,21 +1279,20 @@ class MelodyGUI(QMainWindow):
                     spin.blockSignals(True)
                     spin.setValue(v)
                     spin.blockSignals(False)
-                    self._set_param(k, v)
+                    self._set_param(k, v)  # now debounced internally
                 else:
                     spin.blockSignals(True)
                     spin.setValue(float(v))
                     spin.blockSignals(False)
-                    self._set_param(k, float(v))
+                    self._set_param(k, float(v))  # now debounced internally
 
-            # wire: spin -> slider -> params
             def on_spin(val, k=key, slider=sld, mn_=mn, step_=step, steps_=steps_int, is_int_=is_int):
                 v = float(val)
                 v = float(np.clip(v, mn_, mx))
                 slider.blockSignals(True)
                 slider.setValue(_value_to_slider(v, mn_, step_, steps_))
                 slider.blockSignals(False)
-                self._set_param(k, int(round(v)) if is_int_ else float(v))
+                self._set_param(k, int(round(v)) if is_int_ else float(v))  # now debounced internally
 
             sld.valueChanged.connect(on_slider)
             spn.valueChanged.connect(on_spin)
@@ -1254,7 +1323,7 @@ class MelodyGUI(QMainWindow):
         with self._param_lock:
             blk.params[key] = value
 
-        self._mark_dirty_and_restart_from_playhead()
+        self._schedule_dirty_restart()
 
     def _mark_dirty_and_restart_from_playhead(self):
         self._render_dirty = True

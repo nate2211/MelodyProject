@@ -4,7 +4,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 import os
 import psutil
-
+import threading
+import time
 # ----------------- Audio Buffer -----------------
 
 @dataclass
@@ -467,3 +468,116 @@ class MemoryBallast:
     def clear(self) -> None:
         self._chunks.clear()
         self._held_bytes = 0
+
+class CpuBallast:
+    """
+    Burns CPU on purpose (a controllable "heater") to keep clocks/warm caches or test UI/audio stability.
+
+    target_pct is per-process target across all cores (approx).
+    Implementation: a set of worker threads run a simple duty-cycle loop:
+      - busy spin for on_time
+      - sleep for off_time
+    """
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._target_pct: int = 0
+        self._threads: list[threading.Thread] = []
+        self._lock = threading.Lock()
+
+        # psutil process handle for measurements
+        self._proc = psutil.Process(os.getpid())
+
+        # prime cpu_percent so future calls are non-blocking
+        try:
+            self._proc.cpu_percent(interval=None)
+        except Exception:
+            pass
+
+    def target_pct(self) -> int:
+        with self._lock:
+            return int(self._target_pct)
+
+    def cpu_pct_process(self) -> float:
+        """
+        Returns process CPU percent since last call (non-blocking).
+        Note: can exceed 100% on multi-core systems (psutil convention).
+        """
+        try:
+            return float(self._proc.cpu_percent(interval=None))
+        except Exception:
+            return 0.0
+
+    def set_target_pct(self, target_pct: int, *, workers: int | None = None) -> None:
+        target_pct = int(max(0, min(100, int(target_pct))))
+
+        with self._lock:
+            self._target_pct = target_pct
+
+        if target_pct <= 0:
+            self._ensure_workers(0)
+            return
+
+        # Default: a small number of workers so we don't overwhelm the scheduler.
+        # (More workers than cores can create extra jitter.)
+        if workers is None:
+            try:
+                cores = os.cpu_count() or 4
+            except Exception:
+                cores = 4
+            workers = max(1, min(4, cores))  # keep it sane
+        self._ensure_workers(int(workers))
+
+    def _ensure_workers(self, n: int) -> None:
+        n = int(max(0, n))
+
+        # stop all
+        if n == 0:
+            self.stop()
+            return
+
+        # already running with enough threads
+        if len(self._threads) == n and all(t.is_alive() for t in self._threads):
+            return
+
+        # restart with requested count
+        self.stop()
+        self._stop.clear()
+        self._threads = []
+        for i in range(n):
+            t = threading.Thread(target=self._worker_loop, name=f"CpuBallast-{i}", daemon=True)
+            self._threads.append(t)
+            t.start()
+
+    def _worker_loop(self) -> None:
+        # Duty cycle window (shorter window = smoother response, more overhead)
+        window_s = 0.05  # 50ms
+
+        while not self._stop.is_set():
+            with self._lock:
+                tgt = int(self._target_pct)
+
+            if tgt <= 0:
+                time.sleep(0.1)
+                continue
+
+            on = window_s * (tgt / 100.0)
+            off = max(0.0, window_s - on)
+
+            # Busy section (spin)
+            t_end = time.perf_counter() + on
+            while (not self._stop.is_set()) and (time.perf_counter() < t_end):
+                # tiny arithmetic to prevent the loop from being optimized away
+                _ = 1234567 * 7654321
+
+            # Sleep section
+            if off > 0:
+                time.sleep(off)
+
+    def stop(self) -> None:
+        self._stop.set()
+        for t in self._threads:
+            try:
+                t.join(timeout=0.2)
+            except Exception:
+                pass
+        self._threads = []
