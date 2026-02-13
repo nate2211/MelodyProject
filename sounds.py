@@ -1249,6 +1249,291 @@ class BellFM(BaseBlock):
         return AudioBuffer(st.astype(np.float32, copy=False), sr), {}
 
 
+class LeadSynth(BaseBlock):
+    KIND = "instrument"
+    PARAMS = {
+        "wave": {"type": "choice", "default": "square",
+                 "choices": ["sine", "triangle", "square", "pulse", "saw", "sawtooth"]},
+
+        "amp": {"type": "float", "default": 0.42, "min": 0.0, "max": 1.0, "step": 0.01},
+
+        # Amp env (lead: faster)
+        "attack": {"type": "float", "default": 0.004, "min": 0.0, "max": 2.0, "step": 0.001},
+        "decay": {"type": "float", "default": 0.090, "min": 0.0, "max": 6.0, "step": 0.01},
+        "sustain": {"type": "float", "default": 0.82, "min": 0.0, "max": 1.0, "step": 0.01},
+        "release": {"type": "float", "default": 0.18, "min": 0.0, "max": 6.0, "step": 0.01},
+        "env_curve": {"type": "float", "default": 0.55, "min": 0.15, "max": 2.5, "step": 0.05},
+
+        # Portamento (requires payload["prev_freq"] for true inter-buffer glide)
+        "glide_ms": {"type": "float", "default": 35.0, "min": 0.0, "max": 800.0, "step": 5.0},
+
+        # Vibrato
+        "vib_rate": {"type": "float", "default": 5.6, "min": 0.0, "max": 12.0, "step": 0.1},
+        "vib_depth_cents": {"type": "float", "default": 12.0, "min": 0.0, "max": 120.0, "step": 1.0},
+        "vib_delay": {"type": "float", "default": 0.030, "min": 0.0, "max": 1.0, "step": 0.005},
+
+        # Unison (keep tighter than pads)
+        "unison": {"type": "int", "default": 3, "min": 1, "max": 8, "step": 1},
+        "detune_cents": {"type": "float", "default": 7.0, "min": 0.0, "max": 60.0, "step": 0.5},
+        "spread": {"type": "float", "default": 0.45, "min": 0.0, "max": 1.0, "step": 0.01},
+        "pwm": {"type": "float", "default": 0.52, "min": 0.01, "max": 0.99, "step": 0.01},
+
+        # Thickness oscillator (adds a 2nd pitched layer)
+        "layer": {"type": "float", "default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01},
+        "layer_ratio": {"type": "float", "default": 2.0, "min": 0.25, "max": 8.0, "step": 0.25},  # 2.0=oct, 1.5=5th
+        "layer_wave": {"type": "choice", "default": "saw",
+                       "choices": ["sine", "triangle", "square", "pulse", "saw", "sawtooth"]},
+
+        # Color / edge
+        "sync": {"type": "float", "default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01},
+        "sync_ratio": {"type": "float", "default": 2.0, "min": 1.0, "max": 12.0, "step": 0.25},
+        "fm_ratio": {"type": "float", "default": 0.0, "min": 0.0, "max": 12.0, "step": 0.25},
+        "fm_index": {"type": "float", "default": 0.0, "min": 0.0, "max": 20.0, "step": 0.1},
+        "pm_amount": {"type": "float", "default": 0.05, "min": 0.0, "max": 0.35, "step": 0.005},
+        "pd_amount": {"type": "float", "default": 0.10, "min": -0.95, "max": 0.95, "step": 0.01},
+
+        "drive": {"type": "float", "default": 2.20, "min": 0.25, "max": 10.0, "step": 0.05},
+        "fold": {"type": "float", "default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01},
+        "tilt": {"type": "float", "default": 0.12, "min": -1.0, "max": 1.0, "step": 0.01},
+
+        # Filter
+        "cutoff_hz": {"type": "float", "default": 5200.0, "min": 80.0, "max": 20000.0, "step": 50.0},
+        "res": {"type": "float", "default": 0.35, "min": 0.0, "max": 1.0, "step": 0.01},
+        "keytrack": {"type": "float", "default": 0.55, "min": 0.0, "max": 1.0, "step": 0.01},
+
+        # Filter env (time-varying approximation)
+        "fenv_amt": {"type": "float", "default": 0.55, "min": 0.0, "max": 1.0, "step": 0.01},
+        "fenv_attack": {"type": "float", "default": 0.002, "min": 0.0, "max": 2.0, "step": 0.001},
+        "fenv_decay": {"type": "float", "default": 0.120, "min": 0.0, "max": 6.0, "step": 0.01},
+        "fenv_to_hz": {"type": "float", "default": 14000.0, "min": 200.0, "max": 20000.0, "step": 50.0},
+
+        # Stereo / space (tighter)
+        "width_mix": {"type": "float", "default": 0.18, "min": 0.0, "max": 1.0, "step": 0.01},
+        "width_ms": {"type": "float", "default": 5.0, "min": 0.0, "max": 25.0, "step": 0.5},
+        "chorus_mix": {"type": "float", "default": 0.12, "min": 0.0, "max": 0.6, "step": 0.01},
+        "chorus_rate": {"type": "float", "default": 0.25, "min": 0.02, "max": 4.0, "step": 0.02},
+        "chorus_depth_ms": {"type": "float", "default": 6.0, "min": 0.5, "max": 25.0, "step": 0.5},
+
+        "reverb_mix": {"type": "float", "default": 0.12, "min": 0.0, "max": 0.8, "step": 0.01},
+        "reverb_room": {"type": "float", "default": 0.45, "min": 0.0, "max": 1.0, "step": 0.01},
+        "reverb_predelay_ms": {"type": "float", "default": 14.0, "min": 0.0, "max": 80.0, "step": 1.0},
+        "reverb_damp_hz": {"type": "float", "default": 8000.0, "min": 1500.0, "max": 14000.0, "step": 100.0},
+
+        "pan": {"type": "float", "default": 0.0, "min": -1.0, "max": 1.0, "step": 0.05},
+        "seed": {"type": "int", "default": 0, "min": 0, "max": 999999, "step": 1},
+    }
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        freq = float(payload["freq"])
+        dur = float(payload["duration"])
+        sr = int(payload.get("sr", 48000))
+        vel = float(payload.get("vel", 1.0))
+        prev_freq = payload.get("prev_freq", None)  # optional for portamento
+
+        n = max(1, int(round(dur * sr)))
+        t = (np.arange(n, dtype=np.float32) / float(sr))
+
+        seed = int(params.get("seed", 0))
+        rng = np.random.RandomState(seed & 0xFFFFFFFF)
+
+        wave = params.get("wave", "square")
+        amp = float(params.get("amp", 0.42))
+        pan = float(params.get("pan", 0.0))
+
+        vel = float(np.clip(vel, 0.0, 1.0))
+        vel_gain = 0.50 + 0.85 * (vel ** 0.9)
+        vel_bright = 0.70 + 0.70 * (vel ** 0.9)
+
+        # Amp env
+        env = _adsr_env(
+            n, sr,
+            a=float(params.get("attack", 0.004)),
+            d=float(params.get("decay", 0.090)),
+            s=float(params.get("sustain", 0.82)),
+            r=float(params.get("release", 0.18)),
+            curve=float(params.get("env_curve", 0.55)),
+        )
+
+        # Portamento: glide from prev_freq -> freq inside this buffer (best-effort)
+        glide_ms = float(params.get("glide_ms", 35.0))
+        if prev_freq is None or glide_ms <= 1e-6:
+            f_track = np.full(n, freq, dtype=np.float32)
+        else:
+            f0 = float(max(0.01, prev_freq))
+            f1 = float(max(0.01, freq))
+            gN = int(round((glide_ms / 1000.0) * sr))
+            gN = max(1, min(gN, n))
+            # exponential-ish glide feels more musical
+            xg = np.linspace(0.0, 1.0, gN, dtype=np.float32)
+            k = 4.5
+            w = (1.0 - np.exp(-k * xg)) / (1.0 - np.exp(-k))
+            glide = (1.0 - w) * f0 + w * f1
+            f_track = np.full(n, f1, dtype=np.float32)
+            f_track[:gN] = glide
+
+        # Vibrato (after glide)
+        vib_rate = float(params.get("vib_rate", 5.6))
+        vib_depth_cents = float(params.get("vib_depth_cents", 12.0))
+        vib_delay = float(params.get("vib_delay", 0.030))
+        if vib_rate > 1e-6 and vib_depth_cents > 1e-6:
+            vib_env = np.clip((t - vib_delay) / max(1e-6, (0.030)), 0.0, 1.0).astype(np.float32)
+            vib = np.sin(_TWOPI * vib_rate * t + float(rng.uniform(0, 2*np.pi))).astype(np.float32)
+            cents = (vib_depth_cents * vib_env) * vib
+            f_track = f_track * (2.0 ** (cents / 1200.0)).astype(np.float32)
+
+        # Oscillator rendering with time-varying pitch:
+        # We approximate by rendering using instantaneous phase from cumulative frequency.
+        phase = np.cumsum(f_track / float(sr)).astype(np.float32)  # cycles
+        phase01 = phase % 1.0
+
+        # Build a "t" that matches phase for osc_advanced-like features:
+        # We'll directly compute wave from phase01 for the core wave, then apply osc_advanced-style extras.
+        pwm = float(params.get("pwm", 0.52))
+        sync = float(params.get("sync", 0.10))
+        sync_ratio = float(params.get("sync_ratio", 2.0))
+        pd_amount = float(params.get("pd_amount", 0.10))
+
+        # sync (approx): re-map phase01
+        if sync > 0.0:
+            base = phase01
+            synced = (phase * sync_ratio) % 1.0
+            phase01 = (1.0 - sync) * base + sync * synced
+
+        if pd_amount != 0.0:
+            phase01 = _phase_distort(phase01, pd_amount)
+
+        # dt varies with f_track; use avg for BLEP correction (good enough for lead)
+        dt_avg = float(np.mean(f_track) / float(sr))
+
+        wnorm = _norm_wave(wave, default="square")
+        if wnorm == "sine":
+            core = np.sin(_TWOPI * phase01).astype(np.float32)
+        elif wnorm == "saw":
+            core = _saw_blep(phase01, dt_avg)
+        elif wnorm == "square":
+            core = _square_blep(phase01, dt_avg, pwm=pwm)
+        elif wnorm == "triangle":
+            sq = _square_blep(phase01, dt_avg, pwm=0.5)
+            core = _tri_from_square(sq)
+        else:
+            core = np.sin(_TWOPI * phase01).astype(np.float32)
+
+        # Unison: use osc_advanced as a thickener around mean freq (keeps BLEP clean)
+        # (this preserves your "produced" sound without per-sample unison complexity)
+        thick = osc_advanced(
+            wave=wave,
+            t=t,
+            freq=float(np.mean(f_track)),
+            sr=sr,
+            unison=int(params.get("unison", 3)),
+            detune_cents=float(params.get("detune_cents", 7.0)),
+            spread=float(params.get("spread", 0.45)),
+            pwm=pwm,
+            sync=float(params.get("sync", 0.10)),
+            sync_ratio=sync_ratio,
+            fm_ratio=float(params.get("fm_ratio", 0.0)),
+            fm_index=float(params.get("fm_index", 0.0)) * vel_bright,
+            pm_amount=float(params.get("pm_amount", 0.05)) * vel_bright,
+            pd_amount=0.0,  # already applied above
+            drive=1.0,
+            fold=0.0,
+            tilt=0.0,
+            seed=seed,
+        )
+
+        # Blend core + thickener (core provides glide/vibrato accuracy)
+        x = (0.55 * core + 0.45 * thick).astype(np.float32)
+
+        # Optional 2nd layer (octave/5th/etc)
+        layer = float(params.get("layer", 0.35))
+        if layer > 1e-6:
+            lr = float(params.get("layer_ratio", 2.0))
+            layer_wave = params.get("layer_wave", "saw")
+            x2 = osc_advanced(
+                wave=layer_wave,
+                t=t,
+                freq=float(freq * lr),
+                sr=sr,
+                unison=1,
+                detune_cents=0.0,
+                spread=0.0,
+                pwm=0.5,
+                sync=0.0,
+                sync_ratio=2.0,
+                fm_ratio=0.0,
+                fm_index=0.0,
+                pm_amount=0.0,
+                pd_amount=0.0,
+                drive=1.0,
+                fold=0.0,
+                tilt=0.05,
+                seed=seed + 33,
+            )
+            x = (x + layer * x2).astype(np.float32)
+
+        # Shape / color
+        x = _waveshape(x, drive=float(params.get("drive", 2.20)), fold=float(params.get("fold", 0.10)))
+        x = _tilt_eq(x, tilt=float(params.get("tilt", 0.12)))
+
+        # Amp env + velocity
+        x = (x * env * vel_gain).astype(np.float32)
+
+        # Stereo
+        st = _pan_stereo(np.tanh(x * 1.10).astype(np.float32), pan)
+
+        # Filter: approximate time-varying cutoff by splitting into 3 segments (cheap, musical)
+        base_cutoff = float(params.get("cutoff_hz", 5200.0))
+        keytrack = float(params.get("keytrack", 0.55))
+        cutoff0 = _keytracked_cutoff(base_cutoff, freq, keytrack) * vel_bright
+        res = float(params.get("res", 0.35))
+
+        fenv_amt = float(params.get("fenv_amt", 0.55))
+        if fenv_amt > 1e-6:
+            fa = float(params.get("fenv_attack", 0.002))
+            fd = float(params.get("fenv_decay", 0.120))
+            fenv = _adsr_env(n, sr, a=fa, d=fd, s=0.0, r=0.0, curve=0.55)
+            target = float(params.get("fenv_to_hz", 14000.0))
+            # per-sample cutoff curve, then apply piecewise SVF for stability
+            cutoff_curve = cutoff0 + (target - cutoff0) * (fenv_amt * fenv)
+            cutoff_curve = np.clip(cutoff_curve, 80.0, 0.49 * sr).astype(np.float32)
+
+            # 3-piece approximation
+            i1 = int(n * 0.33)
+            i2 = int(n * 0.66)
+            st[:i1] = _svf_lowpass_stereo(st[:i1], sr, float(np.mean(cutoff_curve[:i1])), res)
+            st[i1:i2] = _svf_lowpass_stereo(st[i1:i2], sr, float(np.mean(cutoff_curve[i1:i2])), res)
+            st[i2:] = _svf_lowpass_stereo(st[i2:], sr, float(np.mean(cutoff_curve[i2:])), res)
+        else:
+            st = _svf_lowpass_stereo(st, sr, cutoff0, res)
+
+        # Width / space (tight)
+        st = _microshift_stereo(
+            st, sr,
+            amount_ms=float(params.get("width_ms", 5.0)),
+            mix=float(params.get("width_mix", 0.18)),
+            seed=seed + 500,
+        )
+        st = _chorus_stereo(
+            st, sr,
+            rate_hz=float(params.get("chorus_rate", 0.25)),
+            depth_ms=float(params.get("chorus_depth_ms", 6.0)),
+            mix=float(params.get("chorus_mix", 0.12)),
+            seed=seed + 7777,
+        )
+        st = _schroeder_reverb_stereo(
+            st, sr,
+            mix=float(params.get("reverb_mix", 0.12)),
+            room=float(params.get("reverb_room", 0.45)),
+            predelay_ms=float(params.get("reverb_predelay_ms", 14.0)),
+            damp_hz=float(params.get("reverb_damp_hz", 8000.0)),
+        )
+
+        # Final
+        st = np.tanh(st * 1.06).astype(np.float32)
+        st = _soft_limiter_stereo(st, ceiling=0.98)
+        st *= float(np.clip(amp, 0.0, 1.0))
+        return AudioBuffer(st.astype(np.float32, copy=False), sr), {}
+
 # ============================================================================
 # FX blocks (simple, stable, mix-friendly)
 # ============================================================================
@@ -1467,12 +1752,17 @@ class Bandpass(BaseBlock):
         return AudioBuffer(y.astype(np.float32, copy=False), sr), {}
 
 
+
+
+
+
 # ============================================================================
 # Register blocks
 # ============================================================================
 BLOCKS.register("synth_keys", SynthKeys)
 BLOCKS.register("guitar_pluck", GuitarPluck)
 BLOCKS.register("bell_fm", BellFM)
+BLOCKS.register("lead_synth", LeadSynth)
 
 BLOCKS.register("gain", Gain)
 BLOCKS.register("delay", Delay)

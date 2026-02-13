@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
 from pipeline import Sequence, Track, BlockInstance, BLOCKS, write_wav, ensure_stereo, AudioBuffer
 import sounds  # registers blocks
 import realism
-import humanize
+import melody_humanize
 
 
 # ----------------- helpers for auto params UI -----------------

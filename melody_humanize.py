@@ -1,4 +1,4 @@
-# humanize.py
+# melody_humanize.py
 # ============================================================================
 # Humanize Synth -> "Real-ish Piano" (less robotic, more acoustic behavior)
 #
