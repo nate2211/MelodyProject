@@ -667,6 +667,8 @@ class MelodyGUI(QMainWindow):
         self._dirty_timer.setSingleShot(True)
         self._dirty_timer.setInterval(60)  # 40-80ms feels good
         self._dirty_timer.timeout.connect(self._apply_dirty_restart)
+        self._pending_dirty_render = False
+        self._last_render_request_t = 0.0
 
         self._pending_dirty_restart = False
 
@@ -970,18 +972,24 @@ class MelodyGUI(QMainWindow):
 
     # ---------------- core helpers ----------------
     def _schedule_dirty_restart(self):
-        # Coalesce many param edits into one restart
-        self._render_dirty = True
+        # Coalesce many param edits into one restart + one render request
         self._pending_dirty_restart = True
+        self._pending_dirty_render = True
+        self._last_render_request_t = time.perf_counter()
+
         if not self._dirty_timer.isActive():
             self._dirty_timer.start()
 
     def _apply_dirty_restart(self):
-        if not self._pending_dirty_restart:
-            return
-        self._pending_dirty_restart = False
-        with self._audio_lock:
-            self._play_pos = self._start_sample_for_current_locked()
+        if self._pending_dirty_restart:
+            self._pending_dirty_restart = False
+            with self._audio_lock:
+                self._play_pos = self._start_sample_for_current_locked()
+
+        # Only mark render dirty AFTER debounce fires
+        if self._pending_dirty_render:
+            self._pending_dirty_render = False
+            self._render_dirty = True
 
     def _set_loop(self, on: bool):
         self._loop = bool(on)
@@ -1553,30 +1561,38 @@ class MelodyGUI(QMainWindow):
         self._render_cache = new_buf
         self._play_pos = self._start_sample_for_current_locked()
         self._render_gen += 1
+
     def _render_tail_and_patch(self):
-        """
-        Re-render only from current play position to end, then patch into cached buffer.
-        Keeps playback smooth on parameter changes.
-        """
         with self._audio_lock:
             old = self._render_cache
             pos = int(self._play_pos)
 
-        # If nothing cached yet, fallback to full render
         if old is None or old.data is None or old.data.size == 0:
             return self._render_full()
 
-        pos = max(0, min(int(old.data.shape[0]), pos))
+        n = int(old.data.shape[0])
+        pos = max(0, min(n, pos))
+
+        # Warmup so FX has history (tweak 0.25–1.0s)
+        warmup = int(0.50 * self.seq.sr)
+        start = max(0, pos - warmup)
 
         with self._param_lock:
-            tail = self.seq.render_from(pos)
+            tail = self.seq.render_from(start)
 
         tail = self._normalize_audio_for_sd(tail)
 
-        head = old.data[:pos].copy()
-        new_data = np.vstack([head, tail.data])
-        return AudioBuffer(new_data.astype(np.float32, copy=False), int(self.seq.sr))
+        # Drop warmup portion so tail aligns at 'pos'
+        drop = pos - start
+        tail_data = tail.data[drop:] if drop > 0 else tail.data
 
+        # Build new buffer with one allocation (copy full old once)
+        new_data = old.data.copy()
+        need = new_data.shape[0] - pos
+        if need > 0 and tail_data.shape[0] > 0:
+            new_data[pos:pos + need] = tail_data[:need]
+
+        return AudioBuffer(new_data.astype(np.float32, copy=False), int(self.seq.sr))
 
     def _render_full(self):
         with self._param_lock:

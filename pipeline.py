@@ -251,16 +251,10 @@ class Sequence:
 
     def render(self, *, common: Dict[str, Any] | None = None) -> AudioBuffer:
         """
-        Polyphonic render (chords + long notes):
-
-        For each track:
-          - allocate a full timeline buffer
-          - for each note event:
-              - for each instrument: generate note buffer for (length_steps * step_seconds)
-              - sum instruments into a note buffer
-              - place note buffer into track timeline at start sample
-          - apply FX chain to the FULL track buffer (serial)
-        Then sum tracks.
+        Polyphonic render (chords + long notes), optimized:
+          - Create instrument/FX blocks ONCE per track per render (no per-note instantiation)
+          - Snapshot params ONCE per track per render
+          - Keep per-note work to pure DSP + mixing
         """
         common = common or {}
         self.ensure()
@@ -276,6 +270,13 @@ class Sequence:
             if not track.instruments:
                 track.instruments = [BlockInstance("synth_keys", {})]
 
+            # ✅ Create generators ONCE per track, snapshot params ONCE
+            inst_gens: list[tuple[BaseBlock, Dict[str, Any]]] = []
+            for inst in track.instruments:
+                inst_gens.append((BLOCKS.create(inst.name), dict(inst.params)))
+
+            fx_chain = [(BLOCKS.create(bi.name), dict(bi.params)) for bi in track.fx]
+
             tbuf = np.zeros((total_n, 2), dtype=np.float32)
 
             for ev in self.notes[ti]:
@@ -290,23 +291,21 @@ class Sequence:
 
                 # Instrument layering for THIS note
                 layer = np.zeros((dur_n, 2), dtype=np.float32)
-                for inst in track.instruments:
-                    # Create a new instance of the block for each render pass
-                    # This ensures that internal state (if any) is fresh,
-                    # and parameters are read from the BlockInstance's dict.
-                    gen = BLOCKS.create(inst.name)
-                    payload = {"freq": freq, "duration": dur_s, "sr": self.sr}
-                    raw, _ = gen.execute(payload, params=dict(inst.params)) # Pass a copy of params
+                payload = {"freq": freq, "duration": dur_s, "sr": self.sr}
+
+                # ✅ No per-note BLOCKS.create(), no per-note dict(inst.params)
+                for gen, p in inst_gens:
+                    raw, _ = gen.execute(payload, params=p)
                     y = ensure_stereo(raw.data)
+
                     if y.shape[0] != dur_n:
-                        # Pad or truncate if the block generates a different length,
-                        # though ideally instrument blocks should match requested duration.
                         if y.shape[0] < dur_n:
-                            padded_y = np.zeros((dur_n, 2), dtype=np.float32)
-                            padded_y[:y.shape[0]] = y
-                            y = padded_y
+                            padded = np.zeros((dur_n, 2), dtype=np.float32)
+                            padded[:y.shape[0]] = y
+                            y = padded
                         else:
                             y = y[:dur_n]
+
                     layer += y
 
                 a = int(ev.start_step) * step_n
@@ -316,22 +315,20 @@ class Sequence:
 
                 tbuf[a:b] += layer[: (b - a)]
 
-            # Apply FX chain to full track
-            fx_chain = [(BLOCKS.create(bi.name), dict(bi.params)) for bi in track.fx]
+            # Apply FX chain to full track (serial)
             out, _ = run_chain(AudioBuffer(tbuf, self.sr), fx_chain, common=common)
             y = ensure_stereo(out.data) * float(track.volume)
 
             mix += y
 
-        # Apply a final soft-clipper to the master mix to prevent harsh clipping
-        # and give a more consistent output level.
         return AudioBuffer(np.tanh(mix).astype(np.float32, copy=False), self.sr)
 
     def render_from(self, start_sample: int, *, common: Dict[str, Any] | None = None) -> AudioBuffer:
         """
-        Fast preview render:
-        Renders ONLY the audio region [start_sample : end] and returns that tail buffer.
-        Export should still use render() for full accuracy/stateful FX correctness.
+        Fast preview render, optimized:
+          - Create instrument/FX blocks ONCE per track per render_from()
+          - Snapshot params ONCE per track
+          - Only render notes that overlap [start_sample..end)
         """
         common = common or {}
         self.ensure()
@@ -343,27 +340,20 @@ class Sequence:
         start_sample = int(max(0, min(total_n, int(start_sample))))
         tail_n = total_n - start_sample
 
-        # If start is at end, return empty tail
         if tail_n <= 0:
             return AudioBuffer(np.zeros((0, 2), dtype=np.float32), self.sr)
 
         mix = np.zeros((tail_n, 2), dtype=np.float32)
 
         def place_tail(dst_tail: np.ndarray, src_note: np.ndarray, note_a: int, note_b: int):
-            """
-            Place overlap of src_note [0..dur) into dst_tail [0..tail_n),
-            but only for overlap with [start_sample..total_n).
-            """
             a = max(note_a, start_sample)
             b = min(note_b, total_n)
             if b <= a:
                 return
 
-            # dst coordinates (tail starts at start_sample)
             da = a - start_sample
             db = b - start_sample
 
-            # src coordinates (note starts at note_a)
             sa = a - note_a
             sb = sa + (db - da)
 
@@ -372,6 +362,13 @@ class Sequence:
         for ti, track in enumerate(self.tracks):
             if not track.instruments:
                 track.instruments = [BlockInstance("synth_keys", {})]
+
+            # ✅ Create generators ONCE per track, snapshot params ONCE
+            inst_gens: list[tuple[BaseBlock, Dict[str, Any]]] = []
+            for inst in track.instruments:
+                inst_gens.append((BLOCKS.create(inst.name), dict(inst.params)))
+
+            fx_chain = [(BLOCKS.create(bi.name), dict(bi.params)) for bi in track.fx]
 
             tbuf = np.zeros((tail_n, 2), dtype=np.float32)
 
@@ -388,17 +385,15 @@ class Sequence:
                 note_a = int(ev.start_step) * step_n
                 note_b = note_a + dur_n
 
-                # If note ends before tail region starts, skip
                 if note_b <= start_sample:
                     continue
 
-                # Render this note (offline) then place only the overlapping part
                 layer = np.zeros((dur_n, 2), dtype=np.float32)
+                payload = {"freq": freq, "duration": dur_s, "sr": self.sr}
 
-                for inst in track.instruments:
-                    gen = BLOCKS.create(inst.name)
-                    payload = {"freq": freq, "duration": dur_s, "sr": self.sr}
-                    raw, _ = gen.execute(payload, params=dict(inst.params))
+                # ✅ No per-note BLOCKS.create(), no per-note dict(inst.params)
+                for gen, p in inst_gens:
+                    raw, _ = gen.execute(payload, params=p)
                     y = ensure_stereo(raw.data)
 
                     if y.shape[0] != dur_n:
@@ -413,14 +408,13 @@ class Sequence:
 
                 place_tail(tbuf, layer, note_a, note_b)
 
-            # Apply FX to the tail (fast preview)
-            fx_chain = [(BLOCKS.create(bi.name), dict(bi.params)) for bi in track.fx]
             out, _ = run_chain(AudioBuffer(tbuf, self.sr), fx_chain, common=common)
             y = ensure_stereo(out.data) * float(track.volume)
 
             mix += y
 
         return AudioBuffer(np.tanh(mix).astype(np.float32, copy=False), self.sr)
+
 
 class MemoryBallast:
     """
