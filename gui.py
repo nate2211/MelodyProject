@@ -1,11 +1,12 @@
 # gui.py
 from __future__ import annotations
 
+import math
 import sys
 import time
 import threading
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
 import sounddevice as sd
@@ -704,7 +705,8 @@ class MelodyGUI(QMainWindow):
         self.btn_stop = QToolButton()
         self.btn_stop.setText("■")
         self.btn_stop.clicked.connect(self.on_stop)
-
+        self.btn_import_midi = QPushButton("Import MIDI")
+        self.btn_import_midi.clicked.connect(self.on_import_midi)
         self.btn_export = QPushButton("Export WAV")
         self.btn_export.clicked.connect(self.on_export)
 
@@ -728,6 +730,7 @@ class MelodyGUI(QMainWindow):
 
         tbar.addStretch(1)
         tbar.addWidget(QLabel("Alt+Click sets playhead"))
+        tbar.addWidget(self.btn_import_midi)
         tbar.addWidget(self.btn_export)
 
         left_layout.addWidget(transport_box)
@@ -1364,6 +1367,157 @@ class MelodyGUI(QMainWindow):
         x = np.ascontiguousarray(x, dtype=np.float32)
         buf.data = x
         return buf
+
+    def _parse_midi_to_notes_and_bars(self, path: str) -> Tuple[
+        Optional[float], int, List[Tuple[int, int, Tuple[str, int]]]]:
+        """
+        Returns: (bpm_or_None, bars_needed, notes)
+        notes: list[(start_step, length_steps, (note_name, octave))]
+
+        Quantizes MIDI ticks into your sequencer steps:
+          steps_per_beat = steps_per_bar / 4  (assumes 4/4 grid)
+        Bars auto-expand to fit the imported MIDI.
+        """
+        try:
+            import mido  # pip install mido
+        except Exception:
+            raise RuntimeError("Missing dependency: mido. Install with: pip install mido")
+
+        mid = mido.MidiFile(path)
+        ppq = int(getattr(mid, "ticks_per_beat", 480) or 480)
+
+        # Try to read BPM from MIDI tempo (optional)
+        bpm: Optional[float] = None
+        tempo_us: Optional[int] = None
+        for tr in mid.tracks:
+            for msg in tr:
+                if getattr(msg, "is_meta", False) and msg.type == "set_tempo":
+                    tempo_us = int(msg.tempo)
+                    break
+            if tempo_us is not None:
+                break
+        if tempo_us is not None and tempo_us > 0:
+            bpm = 60_000_000.0 / float(tempo_us)
+
+        steps_per_bar = int(getattr(self.seq, "steps_per_bar", 16) or 16)
+        steps_per_beat = float(steps_per_bar) / 4.0  # 4/4 assumption
+
+        # Collect note_on/note_off pairs
+        active = {}  # (track_i, channel, note) -> start_tick
+        out_notes: List[Tuple[int, int, Tuple[str, int]]] = []
+        max_end_step = 0
+
+        for track_i, tr in enumerate(mid.tracks):
+            abs_tick = 0
+            for msg in tr:
+                abs_tick += int(getattr(msg, "time", 0) or 0)
+
+                if getattr(msg, "is_meta", False):
+                    continue
+
+                mtype = getattr(msg, "type", "")
+                if mtype not in ("note_on", "note_off"):
+                    continue
+
+                note = int(getattr(msg, "note", 0) or 0)
+                ch = int(getattr(msg, "channel", 0) or 0)
+                vel = int(getattr(msg, "velocity", 0) or 0)
+
+                key = (track_i, ch, note)
+
+                is_on = (mtype == "note_on" and vel > 0)
+                is_off = (mtype == "note_off" or (mtype == "note_on" and vel == 0))
+
+                if is_on:
+                    # If already active, close it (avoid stuck notes)
+                    if key in active:
+                        start_tick = active.pop(key)
+                        start_beats = float(start_tick) / float(ppq)
+                        end_beats = float(abs_tick) / float(ppq)
+                        s0 = int(round(start_beats * steps_per_beat))
+                        s1 = int(round(end_beats * steps_per_beat))
+                        if s1 <= s0:
+                            s1 = s0 + 1
+                        pitch = midi_to_note_oct(note)  # uses your existing helper
+                        out_notes.append((s0, int(s1 - s0), pitch))
+                        max_end_step = max(max_end_step, s1)
+                    active[key] = abs_tick
+
+                elif is_off:
+                    if key not in active:
+                        continue
+                    start_tick = active.pop(key)
+                    start_beats = float(start_tick) / float(ppq)
+                    end_beats = float(abs_tick) / float(ppq)
+                    s0 = int(round(start_beats * steps_per_beat))
+                    s1 = int(round(end_beats * steps_per_beat))
+                    if s1 <= s0:
+                        s1 = s0 + 1
+                    pitch = midi_to_note_oct(note)
+                    out_notes.append((s0, int(s1 - s0), pitch))
+                    max_end_step = max(max_end_step, s1)
+
+        inferred_end_step = max_end_step if out_notes else 0
+
+        # bars needed to fit end step
+        bars_needed = max(1, int(math.ceil(float(max(1, inferred_end_step)) / float(steps_per_bar))))
+
+        # Clamp notes into that range
+        total_steps = bars_needed * steps_per_bar
+        cleaned: List[Tuple[int, int, Tuple[str, int]]] = []
+        for s0, ln, pitch in out_notes:
+            s0 = int(max(0, min(total_steps - 1, int(s0))))
+            ln = int(max(1, int(ln)))
+            if s0 + ln > total_steps:
+                ln = max(1, total_steps - s0)
+            cleaned.append((s0, ln, pitch))
+
+        cleaned.sort(key=lambda x: (x[0], x[2][1], x[2][0]))
+        return bpm, bars_needed, cleaned
+
+    def on_import_midi(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import MIDI", "", "MIDI Files (*.mid *.midi)")
+        if not path:
+            return
+
+        ti = self.current_track_index()
+        if ti < 0:
+            ti = 0
+
+        try:
+            bpm, bars_needed, notes = self._parse_midi_to_notes_and_bars(path)
+        except Exception as e:
+            QMessageBox.critical(self, "MIDI import failed", str(e))
+            return
+
+        with self._param_lock:
+            # adopt BPM if present
+            if bpm is not None and bpm > 1:
+                self.seq.bpm = float(bpm)
+
+            # resize bars to fit
+            self.seq.bars = int(max(1, bars_needed))
+            self.seq.ensure()
+
+            # replace notes on current track
+            while len(self.seq.notes) <= ti:
+                self.seq.notes.append([])
+            self.seq.notes[ti] = []
+
+            for s0, ln, pitch in notes:
+                self.seq.add_note(ti, int(s0), pitch, int(ln))
+
+        # sync Bars spinbox
+        self.bars_spin.blockSignals(True)
+        self.bars_spin.setValue(int(self.seq.bars))
+        self.bars_spin.blockSignals(False)
+
+        # keep playhead valid
+        if self._start_step >= self.seq.total_steps():
+            self._start_step = max(0, self.seq.total_steps() - 1)
+
+        self.rebuild_roll(grid=True, notes=True)
+        self._mark_dirty_and_restart_from_playhead()
 
     # ---------------- playback core ----------------
 
