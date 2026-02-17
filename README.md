@@ -1,4 +1,5 @@
 MelodyProject: Modular DAW & Audio Engine
+<img width="1441" height="869" alt="Screenshot 2026-02-16 221235" src="https://github.com/user-attachments/assets/4b837656-ffe3-40d8-9772-132a8461851a" />
 
 MelodyProject is a lightweight, modular digital audio workstation (DAW) and audio processing engine built with Python, NumPy, and PyQt6. It features an "FL-Studio style" interface with a functional piano roll, polyphonic rendering, and a block-based architecture for instruments and effects.
 🚀 Features
