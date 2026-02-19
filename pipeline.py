@@ -326,9 +326,9 @@ class Sequence:
     def render_from(self, start_sample: int, *, common: Dict[str, Any] | None = None) -> AudioBuffer:
         """
         Fast preview render, optimized:
-          - Create instrument/FX blocks ONCE per track per render_from()
-          - Snapshot params ONCE per track
-          - Only render notes that overlap [start_sample..end)
+          - Only renders notes that overlap the [start_sample..end) window
+          - Fuses multi-instrument layers efficiently
+          - Pre-allocates mix buffer
         """
         common = common or {}
         self.ensure()
@@ -345,20 +345,6 @@ class Sequence:
 
         mix = np.zeros((tail_n, 2), dtype=np.float32)
 
-        def place_tail(dst_tail: np.ndarray, src_note: np.ndarray, note_a: int, note_b: int):
-            a = max(note_a, start_sample)
-            b = min(note_b, total_n)
-            if b <= a:
-                return
-
-            da = a - start_sample
-            db = b - start_sample
-
-            sa = a - note_a
-            sb = sa + (db - da)
-
-            dst_tail[da:db] += src_note[sa:sb]
-
         for ti, track in enumerate(self.tracks):
             if not track.instruments:
                 track.instruments = [BlockInstance("synth_keys", {})]
@@ -371,31 +357,37 @@ class Sequence:
             fx_chain = [(BLOCKS.create(bi.name), dict(bi.params)) for bi in track.fx]
 
             tbuf = np.zeros((tail_n, 2), dtype=np.float32)
+            has_rendered_notes = False
 
             for ev in self.notes[ti]:
-                note, octv = ev.pitch
-                freq = hz_from_note(note, octv)
-
-                dur_steps = max(1, int(ev.length_steps))
-                dur_s = dur_steps * step_s
-                dur_n = int(round(dur_s * self.sr))
-                if dur_n <= 0:
-                    continue
-
                 note_a = int(ev.start_step) * step_n
+
+                # Check 1: Does this note even overlap our tail window?
+                # If the note ends before our start_sample, skip it entirely.
+                dur_steps = max(1, int(ev.length_steps))
+                dur_n = int(round(dur_steps * step_s * self.sr))
                 note_b = note_a + dur_n
 
                 if note_b <= start_sample:
                     continue
 
+                # Check 2: If the note starts after the total length, skip.
+                if note_a >= total_n:
+                    continue
+
+                note, octv = ev.pitch
+                freq = hz_from_note(note, octv)
+                dur_s = dur_steps * step_s
+
+                # Instrument layering for THIS note
                 layer = np.zeros((dur_n, 2), dtype=np.float32)
                 payload = {"freq": freq, "duration": dur_s, "sr": self.sr}
 
-                # ✅ No per-note BLOCKS.create(), no per-note dict(inst.params)
                 for gen, p in inst_gens:
                     raw, _ = gen.execute(payload, params=p)
                     y = ensure_stereo(raw.data)
 
+                    # Fast pad/truncate
                     if y.shape[0] != dur_n:
                         if y.shape[0] < dur_n:
                             pad = np.zeros((dur_n, 2), dtype=np.float32)
@@ -406,15 +398,31 @@ class Sequence:
 
                     layer += y
 
-                place_tail(tbuf, layer, note_a, note_b)
+                # Calculate placement relative to the tail window
+                # a, b are absolute sample positions bounded by the sequence
+                a = max(note_a, start_sample)
+                b = min(note_b, total_n)
+                if b <= a:
+                    continue
 
-            out, _ = run_chain(AudioBuffer(tbuf, self.sr), fx_chain, common=common)
-            y = ensure_stereo(out.data) * float(track.volume)
+                # da, db are relative to the start of our tbuf
+                da = a - start_sample
+                db = b - start_sample
 
-            mix += y
+                # sa, sb are the slice of the note's own buffer
+                sa = a - note_a
+                sb = sa + (db - da)
+
+                tbuf[da:db] += layer[sa:sb]
+                has_rendered_notes = True
+
+            # Only apply track FX if we actually rendered something
+            if has_rendered_notes:
+                out, _ = run_chain(AudioBuffer(tbuf, self.sr), fx_chain, common=common)
+                y = ensure_stereo(out.data) * float(track.volume)
+                mix += y
 
         return AudioBuffer(np.tanh(mix).astype(np.float32, copy=False), self.sr)
-
 
 class MemoryBallast:
     """
