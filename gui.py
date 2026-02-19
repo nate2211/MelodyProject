@@ -618,7 +618,7 @@ class PianoRollView(QGraphicsView):
 class MelodyGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MelodyProject - Piano Roll + Blocks (DAW UI)")
+        self.setWindowTitle("Nate's MelodyProject - Piano Roll + Blocks (DAW UI)")
 
         # Sequencer
         self.seq = Sequence(sr=48000, bpm=120.0, steps_per_bar=16, bars=2)
