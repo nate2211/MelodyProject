@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import math
 import sys
-import time
 import threading
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
-import sounddevice as sd
+
+try:
+    import psutil
+except Exception:
+    psutil = None  # type: ignore
 
 from PyQt6.QtCore import Qt, QEvent, QObject, QRectF, QTimer
 from PyQt6.QtGui import QBrush, QColor, QPen, QPainter, QAction, QFont
@@ -19,76 +22,105 @@ from PyQt6.QtWidgets import (
     QFormLayout, QDoubleSpinBox, QSpinBox, QCheckBox, QMessageBox,
     QScrollArea, QSplitter, QToolButton,
     QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsLineItem,
-    QGraphicsTextItem,QSlider,QLineEdit,
+    QGraphicsTextItem, QSlider, QLineEdit,
 )
 
-from pipeline import Sequence, Track, BlockInstance, BLOCKS, write_wav, ensure_stereo, AudioBuffer, MemoryBallast, CpuBallast
+from audio_engine import AudioEngine
+
+from pipeline import (
+    Sequence,
+    Track,
+    BlockInstance,
+    BLOCKS,
+    MemoryBallast,
+    CpuBallast,
+)
+
 import sounds  # registers blocks
-import realism
-import melody_humanize
+
+try:
+    import realism  # optional extra blocks / polish
+except Exception:
+    realism = None  # type: ignore
+
+try:
+    import melody_humanize  # optional extra blocks / polish
+except Exception:
+    melody_humanize = None  # type: ignore
 
 
-# ----------------- helpers for auto params UI -----------------
+# ============================================================================
+# Block helper functions
+# ============================================================================
 
 def block_params_schema(block_name: str) -> Dict[str, Dict[str, Any]]:
     cls = BLOCKS.cls(block_name)
     return getattr(cls, "PARAMS", {}) or {}
 
+
 def block_kind(block_name: str) -> str:
     cls = BLOCKS.cls(block_name)
     return str(getattr(cls, "KIND", "fx"))
+
 
 def default_params(block_name: str) -> Dict[str, Any]:
     schema = block_params_schema(block_name)
     return {k: v.get("default") for k, v in schema.items()}
 
 
-# ----------------- pitch mapping -----------------
+# ============================================================================
+# Pitch / scale helpers
+# ============================================================================
 
 NOTES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
+
 def midi_to_note_oct(midi: int) -> Tuple[str, int]:
+    midi = int(midi)
     note = NOTES[midi % 12]
     octave = (midi // 12) - 1
     return note, octave
 
+
 def note_oct_to_midi(note: str, octave: int) -> int:
     semi = NOTES.index(note)
-    return (octave + 1) * 12 + semi
+    return (int(octave) + 1) * 12 + semi
 
-
-# ----------------- scale ghost notes -----------------
 
 SCALE_INTERVALS: Dict[str, list[int]] = {
-    "major":               [0, 2, 4, 5, 7, 9, 11],
-    "natural_minor":       [0, 2, 3, 5, 7, 8, 10],
-    "harmonic_minor":      [0, 2, 3, 5, 7, 8, 11],
-    "melodic_minor":       [0, 2, 3, 5, 7, 9, 11],
-    "pentatonic_major":    [0, 2, 4, 7, 9],
-    "pentatonic_minor":    [0, 3, 5, 7, 10],
-    "blues":               [0, 3, 5, 6, 7, 10],
-    "dorian":              [0, 2, 3, 5, 7, 9, 10],
-    "phrygian":            [0, 1, 3, 5, 7, 8, 10],
-    "lydian":              [0, 2, 4, 6, 7, 9, 11],
-    "mixolydian":          [0, 2, 4, 5, 7, 9, 10],
-    "locrian":             [0, 1, 3, 5, 6, 8, 10],
+    "major": [0, 2, 4, 5, 7, 9, 11],
+    "natural_minor": [0, 2, 3, 5, 7, 8, 10],
+    "harmonic_minor": [0, 2, 3, 5, 7, 8, 11],
+    "melodic_minor": [0, 2, 3, 5, 7, 9, 11],
+    "pentatonic_major": [0, 2, 4, 7, 9],
+    "pentatonic_minor": [0, 3, 5, 7, 10],
+    "blues": [0, 3, 5, 6, 7, 10],
+    "dorian": [0, 2, 3, 5, 7, 9, 10],
+    "phrygian": [0, 1, 3, 5, 7, 8, 10],
+    "lydian": [0, 2, 4, 6, 7, 9, 11],
+    "mixolydian": [0, 2, 4, 5, 7, 9, 10],
+    "locrian": [0, 1, 3, 5, 6, 8, 10],
 }
+
 
 def _note_to_semi(note: str) -> int:
     return NOTES.index(note)
+
 
 def _scale_set(root_note: str, scale_name: str) -> set[int]:
     root = _note_to_semi(root_note)
     intervals = SCALE_INTERVALS.get(scale_name, [])
     return {(root + i) % 12 for i in intervals}
 
+
+# ============================================================================
+# Slider helpers
+# ============================================================================
+
 def _slider_steps_for_spec(spec: Dict[str, Any], *, is_int: bool) -> Tuple[float, float, float, int]:
-    """
-    Returns (mn, mx, step, steps_int)
-    steps_int is the slider max (0..steps_int).
-    """
     mn = float(spec.get("min", 0.0))
     mx = float(spec.get("max", 1.0))
+
     if mx <= mn:
         mx = mn + 1.0
 
@@ -99,31 +131,38 @@ def _slider_steps_for_spec(spec: Dict[str, Any], *, is_int: bool) -> Tuple[float
         steps_int = max(1, steps_int)
         return mn, mx, step, steps_int
 
-    # float
     step = float(spec.get("step", 0.01))
+
     if step <= 0:
         step = 0.01
+
     steps_int = int(round((mx - mn) / step))
-    steps_int = max(1, min(20000, steps_int))  # clamp so sliders don't get ridiculous
-    # recompute step from clamped steps for stable mapping
+    steps_int = max(1, min(20000, steps_int))
     step = (mx - mn) / float(steps_int)
+
     return mn, mx, step, steps_int
+
 
 def _value_to_slider(v: float, mn: float, step: float, steps_int: int) -> int:
     i = int(round((float(v) - mn) / step))
     return int(max(0, min(steps_int, i)))
 
+
 def _slider_to_value(i: int, mn: float, step: float) -> float:
     return float(mn + float(i) * step)
+
+
 # ============================================================================
-# Thread-safe callable event (post to QApplication)
+# Thread-safe callable event
 # ============================================================================
 
 class _CallableEvent(QEvent):
     TYPE = QEvent.Type(QEvent.registerEventType())
+
     def __init__(self, fn):
         super().__init__(self.TYPE)
         self.fn = fn
+
 
 class _EventCatcher(QObject):
     def eventFilter(self, obj, e):
@@ -133,6 +172,7 @@ class _EventCatcher(QObject):
             except Exception:
                 pass
             return True
+
         return False
 
 
@@ -142,22 +182,18 @@ class _EventCatcher(QObject):
 
 @dataclass
 class PianoLayout:
-    left_label_w: float = 58.0     # space for note names like C#4
-    top_header_h: float = 20.0     # space for bar/step header
+    left_label_w: float = 58.0
+    top_header_h: float = 20.0
     cell_w: float = 26.0
     row_h: float = 18.0
 
+
 def _safe_text_font(size_pt: int) -> QFont:
-    # Avoid QFont warnings on some systems where default resolves to -1.
     size_pt = max(7, int(size_pt))
     f = QFont()
     f.setPointSize(size_pt)
     return f
 
-
-# ============================================================================
-# Note item
-# ============================================================================
 
 class NoteItem(QGraphicsRectItem):
     def __init__(self, r: QRectF, radius: float = 3.5):
@@ -174,14 +210,7 @@ class NoteItem(QGraphicsRectItem):
 
 
 # ============================================================================
-# FL-ish Piano Roll View
-# - left piano key labels (note+octave)
-# - top step header (optional)
-# - ghost scale shading (fixed: always uses QPen, never PenStyle)
-# - Alt+Click: set start step (no slider / no “start bar”)
-# - Right click: delete note
-# - Drag: create or resize length
-# - Smooth playhead line driven by audio sample position
+# Piano roll
 # ============================================================================
 
 class PianoRollView(QGraphicsView):
@@ -200,21 +229,20 @@ class PianoRollView(QGraphicsView):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setBackgroundBrush(QBrush(QColor(18, 18, 18)))
 
-        # caches
         self._grid_items: list[Any] = []
         self._ghost_rects: list[QGraphicsRectItem] = []
         self._note_items: list[NoteItem] = []
-        self._note_map: list[int] = []          # maps note item -> seq note index (current track)
-        self._label_items: list[Any] = []       # left labels + header text
+        self._note_map: list[int] = []
+        self._label_items: list[Any] = []
         self._note_item_by_index: dict[int, NoteItem] = {}
-        # playhead
+
         self.playhead_line = QGraphicsLineItem()
         self.playhead_line.setZValue(100)
         self.playhead_line.setPen(QPen(QColor(255, 90, 90), 2.0))
         self.scene().addItem(self.playhead_line)
 
-        # drag state
         self._dragging = False
         self._drag_start_step = 0
         self._drag_row = 0
@@ -223,11 +251,9 @@ class PianoRollView(QGraphicsView):
         self._drag_moved = False
         self._drag_last_len = 1
 
-        # background
-        self.setBackgroundBrush(QBrush(QColor(18, 18, 18)))
-
-
-    # ---------- geometry/mapping ----------
+    # ------------------------------------------------------------------
+    # Geometry
+    # ------------------------------------------------------------------
 
     def _cols(self) -> int:
         return int(self.owner.seq.total_steps())
@@ -262,22 +288,25 @@ class PianoRollView(QGraphicsView):
         return self._grid_origin_y() + float(row) * self.layout.row_h
 
     def _pitch_from_row(self, row: int) -> Tuple[str, int]:
-        midi = self.owner.piano_high_midi - row
+        midi = self.owner.piano_high_midi - int(row)
         return midi_to_note_oct(midi)
 
     def _row_from_pitch(self, pitch: Tuple[str, int]) -> Optional[int]:
         note, octv = pitch
         midi = note_oct_to_midi(note, octv)
+
         if not (self.owner.piano_low_midi <= midi <= self.owner.piano_high_midi):
             return None
+
         return self.owner.piano_high_midi - midi
 
-    # ---------- rebuild ----------
+    # ------------------------------------------------------------------
+    # Rebuild
+    # ------------------------------------------------------------------
 
     def rebuild_grid(self):
         sc = self.scene()
 
-        # remove old GRID/LABEL/GHOST only (NOT notes)
         for it in self._grid_items:
             sc.removeItem(it)
         for it in self._ghost_rects:
@@ -294,7 +323,6 @@ class PianoRollView(QGraphicsView):
 
         sc.setSceneRect(0, 0, self._scene_w(), self._scene_h())
 
-        # ----- left note labels background -----
         left_bg = QGraphicsRectItem(0, 0, self.layout.left_label_w, self._scene_h())
         left_bg.setPen(QPen(Qt.PenStyle.NoPen))
         left_bg.setBrush(QBrush(QColor(12, 12, 12)))
@@ -302,7 +330,6 @@ class PianoRollView(QGraphicsView):
         sc.addItem(left_bg)
         self._grid_items.append(left_bg)
 
-        # ----- top header background -----
         top_bg = QGraphicsRectItem(0, 0, self._scene_w(), self.layout.top_header_h)
         top_bg.setPen(QPen(Qt.PenStyle.NoPen))
         top_bg.setBrush(QBrush(QColor(14, 14, 14)))
@@ -310,14 +337,12 @@ class PianoRollView(QGraphicsView):
         sc.addItem(top_bg)
         self._grid_items.append(top_bg)
 
-        # ----- grid -----
         minor = QPen(QColor(35, 35, 35), 1.0)
         major = QPen(QColor(55, 55, 55), 1.0)
-        hpen  = QPen(QColor(30, 30, 30), 1.0)
+        hpen = QPen(QColor(30, 30, 30), 1.0)
 
         bar_every = int(getattr(self.owner.seq, "steps_per_bar", 16) or 16)
 
-        # vertical lines (steps)
         for c in range(cols + 1):
             x = self._grid_origin_x() + c * self.layout.cell_w
             pen = major if (c % bar_every == 0) else minor
@@ -327,7 +352,6 @@ class PianoRollView(QGraphicsView):
             sc.addItem(li)
             self._grid_items.append(li)
 
-        # horizontal lines (pitches)
         for r in range(rows + 1):
             y = self._grid_origin_y() + r * self.layout.row_h
             li = QGraphicsLineItem(self._grid_origin_x(), y, self._scene_w(), y)
@@ -336,14 +360,14 @@ class PianoRollView(QGraphicsView):
             sc.addItem(li)
             self._grid_items.append(li)
 
-        # ----- left labels (note+octave) -----
         label_font = _safe_text_font(8)
+
         for r in range(rows):
             pitch = self._pitch_from_row(r)
             name = f"{pitch[0]}{pitch[1]}"
             y = self._scene_y_from_row(r)
-
             is_black = "#" in pitch[0]
+
             key_rect = QGraphicsRectItem(0, y, self.layout.left_label_w, self.layout.row_h)
             key_rect.setPen(QPen(QColor(30, 30, 30), 1.0))
             key_rect.setBrush(QBrush(QColor(20, 20, 20) if is_black else QColor(26, 26, 26)))
@@ -359,8 +383,8 @@ class PianoRollView(QGraphicsView):
             sc.addItem(t)
             self._label_items.append(t)
 
-        # ----- top bar labels -----
         header_font = _safe_text_font(8)
+
         for c in range(0, cols, bar_every):
             x = self._grid_origin_x() + c * self.layout.cell_w
             bar_idx = (c // bar_every) + 1
@@ -372,8 +396,8 @@ class PianoRollView(QGraphicsView):
             sc.addItem(t)
             self._label_items.append(t)
 
-        # ----- ghost scale shading -----
         ghost_pcs: Optional[set[int]] = None
+
         if self.owner._ghost_root and self.owner._ghost_scale:
             ghost_pcs = _scale_set(self.owner._ghost_root, self.owner._ghost_scale)
 
@@ -381,12 +405,13 @@ class PianoRollView(QGraphicsView):
             for r in range(rows):
                 midi = self.owner.piano_high_midi - r
                 pc = midi % 12
+
                 if pc in ghost_pcs:
                     rr = QGraphicsRectItem(
                         self._grid_origin_x(),
                         self._scene_y_from_row(r),
                         float(cols) * self.layout.cell_w,
-                        self.layout.row_h
+                        self.layout.row_h,
                     )
                     rr.setPen(QPen(Qt.PenStyle.NoPen))
                     rr.setBrush(QBrush(QColor(255, 255, 255, 10)))
@@ -394,28 +419,34 @@ class PianoRollView(QGraphicsView):
                     sc.addItem(rr)
                     self._ghost_rects.append(rr)
 
-        # keep playhead visible
         self.set_playhead_step(self.owner._start_step)
 
     def rebuild_notes(self):
         sc = self.scene()
 
-        # remove only note items
         for it in self._note_items:
             sc.removeItem(it)
+
         self._note_items.clear()
         self._note_map.clear()
         self._note_item_by_index.clear()
-        cols = self._cols()
+
         ti = self.owner.current_track_index()
+
         if ti < 0:
             ti = 0
+
         self.owner.seq.ensure()
+
+        if ti >= len(self.owner.seq.notes):
+            return
 
         for idx, ev in enumerate(self.owner.seq.notes[ti]):
             row = self._row_from_pitch(ev.pitch)
+
             if row is None:
                 continue
+
             x = self._scene_x_from_step(float(ev.start_step))
             y = self._scene_y_from_row(row)
             w = float(max(1, ev.length_steps)) * self.layout.cell_w
@@ -425,32 +456,38 @@ class PianoRollView(QGraphicsView):
             ni.setBrush(QBrush(QColor(60, 150, 255)))
             ni.setOpacity(0.95)
             sc.addItem(ni)
+
             self._note_items.append(ni)
             self._note_map.append(idx)
             self._note_item_by_index[idx] = ni
 
         self.set_playhead_step(self.owner._start_step)
+
     def set_playhead_step(self, step_float: float):
-        x = self._scene_x_from_step(step_float)
+        x = self._scene_x_from_step(float(step_float))
         x = max(self._grid_origin_x(), min(self._scene_w(), x))
         self.playhead_line.setLine(x, self._grid_origin_y(), x, self._scene_h())
 
-    # ---------- interaction ----------
     def update_note_item(self, note_idx: int):
         ti = self.owner.current_track_index()
+
         if ti < 0:
             return
 
         item = self._note_item_by_index.get(note_idx)
+
         if item is None:
             return
 
-        # Note indices can shift if notes were deleted; guard
+        if ti >= len(self.owner.seq.notes):
+            return
+
         if not (0 <= note_idx < len(self.owner.seq.notes[ti])):
             return
 
         ev = self.owner.seq.notes[ti][note_idx]
         row = self._row_from_pitch(ev.pitch)
+
         if row is None:
             return
 
@@ -460,22 +497,29 @@ class PianoRollView(QGraphicsView):
         h = self.layout.row_h
 
         item.setRect(QRectF(x + 1, y + 1, w - 2, h - 2))
+
+    # ------------------------------------------------------------------
+    # Interaction
+    # ------------------------------------------------------------------
+
     def wheelEvent(self, ev):
         if ev.modifiers() & Qt.KeyboardModifier.ControlModifier:
             delta = ev.angleDelta().y()
+
             if delta > 0:
                 self.scale(1.12, 1.0)
             else:
                 self.scale(1 / 1.12, 1.0)
+
             ev.accept()
             return
+
         super().wheelEvent(ev)
 
     def mousePressEvent(self, ev):
         if ev.button() == Qt.MouseButton.LeftButton:
             sp = self.mapToScene(ev.pos())
 
-            # Only interact if inside grid region (ignore left labels / top header)
             if sp.x() < self._grid_origin_x() or sp.y() < self._grid_origin_y():
                 ev.accept()
                 return
@@ -484,18 +528,18 @@ class PianoRollView(QGraphicsView):
             row = self._row_from_scene_y(sp.y())
             pitch = self._pitch_from_row(row)
 
-            # Alt+Click sets playhead/start
             if ev.modifiers() & Qt.KeyboardModifier.AltModifier:
                 self.owner._set_start_step(step)
                 ev.accept()
                 return
 
             ti = self.owner.current_track_index()
+
             if ti < 0:
                 ti = 0
 
-            # Existing note => start resize (NO rebuild here)
             idx = self.owner.seq.find_note_covering(ti, step, pitch)
+
             if idx is not None:
                 ev0 = self.owner.seq.notes[ti][idx]
                 self._dragging = True
@@ -508,7 +552,6 @@ class PianoRollView(QGraphicsView):
                 ev.accept()
                 return
 
-            # New note => add then rebuild NOTES ONLY (so it appears + indices are correct)
             new_idx = self.owner.seq.add_note(ti, step, pitch, 1)
             self._dragging = True
             self._drag_start_step = int(step)
@@ -519,12 +562,12 @@ class PianoRollView(QGraphicsView):
             self._drag_last_len = 1
 
             self.owner.rebuild_roll(grid=False, notes=True)
-
             ev.accept()
             return
 
         if ev.button() == Qt.MouseButton.RightButton:
             sp = self.mapToScene(ev.pos())
+
             if sp.x() < self._grid_origin_x() or sp.y() < self._grid_origin_y():
                 ev.accept()
                 return
@@ -534,14 +577,14 @@ class PianoRollView(QGraphicsView):
             pitch = self._pitch_from_row(row)
 
             ti = self.owner.current_track_index()
+
             if ti < 0:
                 ti = 0
 
             idx = self.owner.seq.find_note_covering(ti, step, pitch)
+
             if idx is not None:
                 self.owner.seq.remove_note(ti, idx)
-
-                # IMPORTANT: notes-only rebuild because indices shift after deletion
                 self.owner.rebuild_roll(grid=False, notes=True)
                 self.owner._mark_dirty_and_restart_from_playhead()
 
@@ -553,6 +596,7 @@ class PianoRollView(QGraphicsView):
     def mouseMoveEvent(self, ev):
         if self._dragging and self._drag_note_index is not None:
             sp = self.mapToScene(ev.pos())
+
             if sp.x() < self._grid_origin_x() or sp.y() < self._grid_origin_y():
                 ev.accept()
                 return
@@ -567,13 +611,11 @@ class PianoRollView(QGraphicsView):
                 self._drag_moved = True
 
                 ti = self.owner.current_track_index()
+
                 if ti < 0:
                     ti = 0
 
-                # model update
                 self.owner.seq.set_note_length(ti, self._drag_note_index, length)
-
-                # FAST PATH: update just the one rect
                 self.update_note_item(self._drag_note_index)
 
             ev.accept()
@@ -584,17 +626,16 @@ class PianoRollView(QGraphicsView):
     def mouseReleaseEvent(self, ev):
         if self._dragging and ev.button() == Qt.MouseButton.LeftButton:
             ti = self.owner.current_track_index()
+
             if ti < 0:
                 ti = 0
+
             idx = self._drag_note_index
 
-            # click existing without movement => delete (indices shift -> rebuild notes only)
             if self._drag_was_existing and (not self._drag_moved) and idx is not None:
                 self.owner.seq.remove_note(ti, idx)
                 self.owner.rebuild_roll(grid=False, notes=True)
             else:
-                # no delete; we already updated rect live during drag
-                # (optional) keep playhead stable
                 self.owner.rebuild_roll(grid=False, notes=False)
 
             self._dragging = False
@@ -609,18 +650,16 @@ class PianoRollView(QGraphicsView):
 
         super().mouseReleaseEvent(ev)
 
+
 # ============================================================================
 # Main GUI
-# - removed "start bar" slider entirely
-# - playhead set via Alt+Click in piano roll
-# - ghost scale fully working
 # ============================================================================
+
 class MelodyGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Nate's MelodyProject - Piano Roll + Blocks (DAW UI)")
+        self.setWindowTitle("Nate's MelodyProject - Fast Live Piano Roll + Blocks")
 
-        # Sequencer
         self.seq = Sequence(sr=48000, bpm=120.0, steps_per_bar=16, bars=2)
         self.seq.tracks = [
             Track(name="Track 1", instruments=[BlockInstance("synth_keys", default_params("synth_keys"))]),
@@ -628,13 +667,10 @@ class MelodyGUI(QMainWindow):
         ]
         self.seq.ensure()
 
-        # Visible range
-        self.piano_low_midi = 12    # C0
-        self.piano_high_midi = 127  # G9 (highest MIDI note)
-        self._piano_rows = (self.piano_high_midi - self.piano_low_midi + 1)
+        self.piano_low_midi = 12
+        self.piano_high_midi = 127
+        self._piano_rows = self.piano_high_midi - self.piano_low_midi + 1
 
-        # state
-        self._playing = False
         self._loop = False
         self._start_step = 0
 
@@ -642,44 +678,52 @@ class MelodyGUI(QMainWindow):
         self._ghost_scale: Optional[str] = None
 
         self._editing: Optional[Tuple[int, str, int]] = None
+        self._param_lock = threading.RLock()
+        self._param_dragging = False
+        self._pending_dirty_render = False
 
-        # audio state
-        self._render_dirty = True
-        self._render_cache = None
-        self._play_pos = 0
+        self._ballast = MemoryBallast()
+        self._ballast_target_mb = 0
 
-        self._audio_lock = threading.Lock()
-        self._param_lock = threading.Lock()
+        self._cpu_ballast = CpuBallast()
+        self._cpu_ballast_target_pct = 0
+        self._process_for_stats = psutil.Process() if psutil else None
 
-        self._render_gen = 0
-        self._stop_evt = threading.Event()
-        self._audio_thread: Optional[threading.Thread] = None
+        self.audio = AudioEngine(
+            self.seq,
+            blocksize=512,
+            latency="low",
+            preview_seconds=8.0,
+            preview_debounce_ms=35,
+            full_debounce_ms=650,
+            on_error=self._post_error,
+        )
 
         self._ui_timer = QTimer(self)
         self._ui_timer.setInterval(16)
         self._ui_timer.timeout.connect(self._tick_ui)
-        self._ballast = MemoryBallast()
-        self._ballast_target_mb = 0
-        self._cpu_ballast = CpuBallast()
-        self._cpu_ballast_target_pct = 0
-        # Debounce param-driven rerenders so UI doesn't hitch
+
         self._dirty_timer = QTimer(self)
         self._dirty_timer.setSingleShot(True)
-        self._dirty_timer.setInterval(60)  # 40-80ms feels good
+        self._dirty_timer.setInterval(35)
         self._dirty_timer.timeout.connect(self._apply_dirty_restart)
-        self._pending_dirty_render = False
-        self._last_render_request_t = 0.0
 
-        self._pending_dirty_restart = False
+        self._full_render_timer = QTimer(self)
+        self._full_render_timer.setSingleShot(True)
+        self._full_render_timer.setInterval(700)
+        self._full_render_timer.timeout.connect(self._apply_full_idle_render)
 
         self.init_ui()
         self._apply_dark_daw_theme()
 
-    # ---------------- UI ----------------
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
 
     def init_ui(self):
         root = QWidget()
         self.setCentralWidget(root)
+
         main = QHBoxLayout(root)
         main.setContentsMargins(10, 10, 10, 10)
         main.setSpacing(10)
@@ -687,13 +731,11 @@ class MelodyGUI(QMainWindow):
         lr_split = QSplitter(Qt.Orientation.Horizontal)
         main.addWidget(lr_split)
 
-        # LEFT (Transport + Ghost + Roll)
         left_pane = QWidget()
         left_layout = QVBoxLayout(left_pane)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(10)
 
-        # Transport (no start slider)
         transport_box = QGroupBox("Transport")
         tbar = QHBoxLayout(transport_box)
         tbar.setContentsMargins(10, 10, 10, 10)
@@ -707,49 +749,46 @@ class MelodyGUI(QMainWindow):
         self.btn_stop = QToolButton()
         self.btn_stop.setText("■")
         self.btn_stop.clicked.connect(self.on_stop)
-        self.btn_import_midi = QPushButton("Import MIDI")
-        self.btn_import_midi.clicked.connect(self.on_import_midi)
-        self.btn_export = QPushButton("Export WAV")
-        self.btn_export.clicked.connect(self.on_export)
 
         self.loop_box = QCheckBox("Loop")
         self.loop_box.stateChanged.connect(lambda _: self._set_loop(self.loop_box.isChecked()))
 
         self.bars_spin = QSpinBox()
         self.bars_spin.setMinimum(1)
-        self.bars_spin.setMaximum(64)  # pick whatever max you want
+        self.bars_spin.setMaximum(64)
         self.bars_spin.setValue(int(self.seq.bars))
         self.bars_spin.setFixedWidth(70)
         self.bars_spin.valueChanged.connect(self.on_bars_changed)
 
+        self.btn_import_midi = QPushButton("Import MIDI")
+        self.btn_import_midi.clicked.connect(self.on_import_midi)
+
+        self.btn_export = QPushButton("Export WAV")
+        self.btn_export.clicked.connect(self.on_export)
+
         tbar.addWidget(self.btn_play_toggle)
         tbar.addWidget(self.btn_stop)
         tbar.addWidget(self.loop_box)
-
         tbar.addSpacing(10)
         tbar.addWidget(QLabel("Bars"))
         tbar.addWidget(self.bars_spin)
-
         tbar.addStretch(1)
         tbar.addWidget(QLabel("Alt+Click sets playhead"))
         tbar.addWidget(self.btn_import_midi)
         tbar.addWidget(self.btn_export)
 
         left_layout.addWidget(transport_box)
-        # ---- Memory (ballast) ----
-        # ---- Memory + CPU ballast (same row) ----
+
         mem_row = QHBoxLayout()
 
-        # RAM ballast
         self.mem_spin = QSpinBox()
-        self.mem_spin.setRange(0, 8192)  # up to 8GB; adjust
+        self.mem_spin.setRange(0, 8192)
         self.mem_spin.setValue(0)
         self.mem_spin.setFixedWidth(90)
         self.mem_spin.valueChanged.connect(self.on_mem_ballast_changed)
 
-        # CPU ballast
         self.cpu_spin = QSpinBox()
-        self.cpu_spin.setRange(0, 100)  # %
+        self.cpu_spin.setRange(0, 80)
         self.cpu_spin.setValue(0)
         self.cpu_spin.setFixedWidth(70)
         self.cpu_spin.valueChanged.connect(self.on_cpu_ballast_changed)
@@ -766,7 +805,7 @@ class MelodyGUI(QMainWindow):
         mem_row.addStretch(1)
 
         left_layout.addLayout(mem_row)
-        # Ghost scale
+
         ghost_box = QGroupBox("Ghost scale")
         ghost_row = QHBoxLayout(ghost_box)
         ghost_row.setContentsMargins(10, 10, 10, 10)
@@ -790,9 +829,9 @@ class MelodyGUI(QMainWindow):
         ghost_row.addWidget(QLabel("Scale"))
         ghost_row.addWidget(self.ghost_scale)
         ghost_row.addStretch(1)
+
         left_layout.addWidget(ghost_box)
 
-        # Piano roll
         roll_box = QGroupBox("Piano Roll")
         roll_l = QVBoxLayout(roll_box)
         roll_l.setContentsMargins(10, 10, 10, 10)
@@ -800,19 +839,17 @@ class MelodyGUI(QMainWindow):
 
         self.roll = PianoRollView(self)
         roll_l.addWidget(self.roll, 1)
+
         left_layout.addWidget(roll_box, 1)
 
-        # RIGHT (tracks + stacks + params)
-        # RIGHT (tracks + stacks + params) -> make resizable with vertical splitter
         right_pane = QWidget()
         right_layout = QVBoxLayout(right_pane)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(0)  # splitter handles spacing
+        right_layout.setSpacing(0)
 
         right_split = QSplitter(Qt.Orientation.Vertical)
         right_layout.addWidget(right_split, 1)
 
-        # ---- Tracks ----
         tracks_box = QGroupBox("Tracks")
         tracks_l = QVBoxLayout(tracks_box)
         tracks_l.setContentsMargins(10, 10, 10, 10)
@@ -824,7 +861,6 @@ class MelodyGUI(QMainWindow):
         tracks_box.setMinimumHeight(120)
         right_split.addWidget(tracks_box)
 
-        # ---- Instruments ----
         inst_box = QGroupBox("Instruments (layered)")
         inst_layout = QVBoxLayout(inst_box)
         inst_layout.setContentsMargins(10, 10, 10, 10)
@@ -852,7 +888,6 @@ class MelodyGUI(QMainWindow):
         inst_box.setMinimumHeight(150)
         right_split.addWidget(inst_box)
 
-        # ---- FX ----
         fx_box = QGroupBox("FX (serial)")
         fx_layout = QVBoxLayout(fx_box)
         fx_layout.setContentsMargins(10, 10, 10, 10)
@@ -880,7 +915,6 @@ class MelodyGUI(QMainWindow):
         fx_box.setMinimumHeight(150)
         right_split.addWidget(fx_box)
 
-        # ---- Block Params ----
         self.params_outer = QGroupBox("Block Params")
         outer_v = QVBoxLayout(self.params_outer)
         outer_v.setContentsMargins(10, 10, 10, 10)
@@ -896,13 +930,10 @@ class MelodyGUI(QMainWindow):
         self.params_outer.setMinimumHeight(220)
         right_split.addWidget(self.params_outer)
 
-        # Give the params pane most of the space
-        right_split.setStretchFactor(0, 0)  # Tracks
-        right_split.setStretchFactor(1, 1)  # Instruments
-        right_split.setStretchFactor(2, 1)  # FX
-        right_split.setStretchFactor(3, 3)  # Params
-
-        # (Optional) nice initial sizes
+        right_split.setStretchFactor(0, 0)
+        right_split.setStretchFactor(1, 1)
+        right_split.setStretchFactor(2, 1)
+        right_split.setStretchFactor(3, 3)
         right_split.setSizes([150, 220, 220, 380])
 
         lr_split.addWidget(left_pane)
@@ -910,12 +941,11 @@ class MelodyGUI(QMainWindow):
         lr_split.setStretchFactor(0, 3)
         lr_split.setStretchFactor(1, 1)
 
-        # init
         self.refresh_tracks()
         self.track_list.setCurrentRow(0)
         self.rebuild_roll()
+        self._update_mem_label()
 
-        # Space toggles play/pause
         act = QAction(self)
         act.setShortcut("Space")
         act.triggered.connect(lambda: self.btn_play_toggle.click())
@@ -944,7 +974,6 @@ class MelodyGUI(QMainWindow):
         }
         QPushButton:hover { background: #2d2d2d; }
         QPushButton:pressed { background: #1f1f1f; }
-
         QToolButton {
             background: #262626;
             border: 1px solid #353535;
@@ -953,8 +982,10 @@ class MelodyGUI(QMainWindow):
             font-size: 16px;
             min-width: 34px;
         }
-        QToolButton:checked { background: #1e3a57; border-color: #2f6aa0; }
-
+        QToolButton:checked {
+            background: #1e3a57;
+            border-color: #2f6aa0;
+        }
         QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox {
             background: #1d1d1d;
             border: 1px solid #333333;
@@ -967,53 +998,67 @@ class MelodyGUI(QMainWindow):
             border-radius: 8px;
         }
         QScrollArea { border: none; }
+        QSlider::groove:horizontal {
+            background: #252525;
+            height: 6px;
+            border-radius: 3px;
+        }
+        QSlider::handle:horizontal {
+            background: #4a90e2;
+            border: 1px solid #75aef0;
+            width: 14px;
+            margin: -5px 0;
+            border-radius: 7px;
+        }
         """)
-        self.roll.setStyleSheet("background: #111111; border: 1px solid #2f2f2f; border-radius: 10px;")
 
-    # ---------------- core helpers ----------------
-    def _schedule_dirty_restart(self):
-        # Coalesce many param edits into one restart + one render request
-        self._pending_dirty_restart = True
-        self._pending_dirty_render = True
-        self._last_render_request_t = time.perf_counter()
+        self.roll.setStyleSheet(
+            "background: #111111; border: 1px solid #2f2f2f; border-radius: 10px;"
+        )
 
-        if not self._dirty_timer.isActive():
-            self._dirty_timer.start()
+    # ------------------------------------------------------------------
+    # Safe event posting
+    # ------------------------------------------------------------------
 
-    def _apply_dirty_restart(self):
-        if self._pending_dirty_restart:
-            self._pending_dirty_restart = False
-            with self._audio_lock:
-                self._play_pos = self._start_sample_for_current_locked()
+    def _post_error(self, title: str, body: str):
+        app = QApplication.instance()
 
-        # Only mark render dirty AFTER debounce fires
-        if self._pending_dirty_render:
-            self._pending_dirty_render = False
-            self._render_dirty = True
+        if app is None:
+            return
+
+        def show():
+            QMessageBox.critical(self, title, body)
+
+        QApplication.postEvent(app, _CallableEvent(show))
+
+    # ------------------------------------------------------------------
+    # Core helpers
+    # ------------------------------------------------------------------
+
+    def _step_samples(self) -> int:
+        try:
+            return int(self.seq.step_samples())
+        except Exception:
+            return max(1, int(round(self.seq.step_seconds() * self.seq.sr)))
 
     def _set_loop(self, on: bool):
         self._loop = bool(on)
-
-        if self._playing and self._loop:
-            with self._audio_lock:
-                buf = self._render_cache
-                if buf is not None and buf.data is not None:
-                    n = int(buf.data.shape[0])
-                    if n > 0 and self._play_pos >= n:
-                        self._play_pos = self._start_sample_for_current_locked()
+        self.audio.set_loop(self._loop)
 
     def _set_start_step(self, step: int):
-        step = int(max(0, min(self.seq.total_steps() - 1, step)))
-        self._start_step = step
-        with self._audio_lock:
-            self._play_pos = self._start_sample_for_current_locked()
-        self.roll.set_playhead_step(step)
+        self._start_step = int(max(0, min(self.seq.total_steps() - 1, int(step))))
+        self.roll.set_playhead_step(self._start_step)
+
+        if self.audio.is_playing:
+            self.audio.seek(self._start_step * self._step_samples())
 
     def on_ghost_changed(self, *_):
         r = self.ghost_root.currentText().strip()
         s = self.ghost_scale.currentText().strip()
+
         self._ghost_root = None if r.lower() == "none" else r
         self._ghost_scale = None if s.lower() == "none" else s
+
         self.rebuild_roll()
 
     def current_track_index(self) -> int:
@@ -1021,143 +1066,277 @@ class MelodyGUI(QMainWindow):
 
     def refresh_tracks(self):
         self.track_list.clear()
+
         for t in self.seq.tracks:
             self.track_list.addItem(t.name)
 
     def on_track_selected(self, idx: int):
         if idx < 0:
             return
+
         self.refresh_stacks(idx)
         self.clear_param_editor()
         self.rebuild_roll()
-        self._mark_dirty_and_restart_from_playhead()
 
     def refresh_stacks(self, track_i: int):
-        tr = self.seq.tracks[track_i]
+        if not (0 <= int(track_i) < len(self.seq.tracks)):
+            return
+
+        tr = self.seq.tracks[int(track_i)]
+
         self.inst_list.clear()
         for bi in tr.instruments:
             self.inst_list.addItem(f"{bi.name}")
+
         self.fx_list.clear()
         for bi in tr.fx:
             self.fx_list.addItem(f"{bi.name}")
 
     def rebuild_roll(self, *, grid: bool = True, notes: bool = True):
         self.seq.ensure()
+
         if grid:
             self.roll.rebuild_grid()
+
         if notes:
             self.roll.rebuild_notes()
+
         self.roll.set_playhead_step(self._start_step)
 
-    # ---------------- stacks ----------------
+    # ------------------------------------------------------------------
+    # Fast dirty render scheduling
+    # ------------------------------------------------------------------
+
+    def _mark_dirty_and_restart_from_playhead(self, *, full_later: bool = True):
+        """
+        Called after notes, params, FX, instruments, bars, or MIDI change.
+
+        This does not render in the GUI thread.
+        It schedules a fast preview render through AudioEngine.
+        """
+        try:
+            self.seq.touch()
+        except Exception:
+            pass
+
+        self._pending_dirty_render = True
+        self._dirty_timer.start()
+
+        if full_later:
+            self._full_render_timer.start()
+
+    def _apply_dirty_restart(self):
+        if not self._pending_dirty_render:
+            return
+
+        self._pending_dirty_render = False
+
+        if self.audio.is_playing:
+            self.audio.request_preview_rerender(immediate=False, full_later=True)
+
+    def _apply_full_idle_render(self):
+        if self.audio.is_playing:
+            self.audio.request_full_rerender(immediate=False)
+
+    # ------------------------------------------------------------------
+    # Stack editing
+    # ------------------------------------------------------------------
 
     def add_instrument(self):
         ti = self.current_track_index()
+
         if ti < 0:
             return
+
         name = self.inst_picker.currentText().strip().lower()
+
         with self._param_lock:
             self.seq.tracks[ti].instruments.append(BlockInstance(name, default_params(name)))
+
         self.refresh_stacks(ti)
         self._mark_dirty_and_restart_from_playhead()
 
     def remove_instrument(self):
         ti = self.current_track_index()
+
         if ti < 0:
             return
+
         idx = self.inst_list.currentRow()
+
         if idx < 0:
             return
+
         with self._param_lock:
             tr = self.seq.tracks[ti]
+
             if 0 <= idx < len(tr.instruments):
                 tr.instruments.pop(idx)
+
         self.refresh_stacks(ti)
         self.clear_param_editor()
         self._mark_dirty_and_restart_from_playhead()
 
     def add_fx(self):
         ti = self.current_track_index()
+
         if ti < 0:
             return
+
         name = self.fx_picker.currentText().strip().lower()
+
         with self._param_lock:
             self.seq.tracks[ti].fx.append(BlockInstance(name, default_params(name)))
+
         self.refresh_stacks(ti)
         self._mark_dirty_and_restart_from_playhead()
 
     def remove_fx(self):
         ti = self.current_track_index()
+
         if ti < 0:
             return
+
         idx = self.fx_list.currentRow()
+
         if idx < 0:
             return
+
         with self._param_lock:
             tr = self.seq.tracks[ti]
+
             if 0 <= idx < len(tr.fx):
                 tr.fx.pop(idx)
+
         self.refresh_stacks(ti)
         self.clear_param_editor()
         self._mark_dirty_and_restart_from_playhead()
 
+    # ------------------------------------------------------------------
+    # Ballast controls
+    # ------------------------------------------------------------------
+
+    def _ballast_release_safe(self):
+        for name in ("release", "clear"):
+            fn = getattr(self._ballast, name, None)
+
+            if callable(fn):
+                try:
+                    fn()
+                    return
+                except Exception:
+                    pass
+
+        try:
+            self._ballast.set_target_mb(0)
+        except Exception:
+            pass
+
+    def _ballast_set_safe(self, mb: int):
+        try:
+            self._ballast.set_target_mb(mb)
+            return
+        except TypeError:
+            pass
+        except Exception:
+            raise
+
+        try:
+            self._ballast.set_target_mb(mb, touch=True, chunk_mb=32)
+        except Exception:
+            raise
+
+    def _ballast_held_mb_safe(self) -> float:
+        try:
+            val = getattr(self._ballast, "held_mb")
+            return float(val() if callable(val) else val)
+        except Exception:
+            return float(self._ballast_target_mb)
+
     def on_cpu_ballast_changed(self, pct: int):
-        pct = int(max(0, min(100, int(pct))))
+        pct = int(max(0, min(80, int(pct))))
+
         if pct != self.cpu_spin.value():
             self.cpu_spin.blockSignals(True)
             self.cpu_spin.setValue(pct)
             self.cpu_spin.blockSignals(False)
 
         self._cpu_ballast_target_pct = pct
+
         try:
             self._cpu_ballast.set_target_pct(pct)
         except Exception:
-            # if anything goes wrong, fail safe
-            self._cpu_ballast.stop()
+            try:
+                self._cpu_ballast.stop()
+            except Exception:
+                pass
+
             self._cpu_ballast_target_pct = 0
             self.cpu_spin.blockSignals(True)
             self.cpu_spin.setValue(0)
             self.cpu_spin.blockSignals(False)
 
         self._update_mem_label()
+
     def on_mem_ballast_changed(self, mb: int):
-        # Safety: don't eat all RAM. Keep at least 512MB available.
+        mb = int(max(0, int(mb)))
+
         try:
-            avail = self._ballast.avail_mb()
-            safe_max = max(0, avail - 512)
-            mb = int(max(0, min(int(mb), safe_max)))
+            if psutil:
+                avail_mb = int(psutil.virtual_memory().available / (1024 * 1024))
+                safe_max = max(0, avail_mb - 512)
+                mb = int(max(0, min(mb, safe_max)))
+
             if mb != self.mem_spin.value():
                 self.mem_spin.blockSignals(True)
                 self.mem_spin.setValue(mb)
                 self.mem_spin.blockSignals(False)
 
             self._ballast_target_mb = mb
-            self._ballast.set_target_mb(mb, touch=True, chunk_mb=32)
-            self._update_mem_label()
+            self._ballast_set_safe(mb)
+
         except Exception:
-            # If allocation fails, back off
-            self._ballast.clear()
+            self._ballast_release_safe()
             self._ballast_target_mb = 0
-            self._update_mem_label()
+
+            self.mem_spin.blockSignals(True)
+            self.mem_spin.setValue(0)
+            self.mem_spin.blockSignals(False)
+
+        self._update_mem_label()
 
     def _update_mem_label(self):
         try:
-            rss = self._ballast.rss_mb()
-            held = self._ballast.held_mb()
-            avail = self._ballast.avail_mb()
+            rss_mb = "?"
+            avail_mb = "?"
+            held_mb = "?"
+            cpu_raw = "?"
+            cpu_norm = "?"
+            cores = "?"
 
-            # raw can exceed 100 on multi-core
-            cpu_raw = float(self._cpu_ballast.cpu_pct_process_raw())
-            cpu_norm = float(self._cpu_ballast.cpu_pct_process_norm())  # 0..100 normalized to whole CPU
-            cores = int(self._cpu_ballast.cpu_count())
+            if psutil:
+                proc = self._process_for_stats or psutil.Process()
+                rss_mb = int(proc.memory_info().rss / (1024 * 1024))
+                avail_mb = int(psutil.virtual_memory().available / (1024 * 1024))
+                cores = int(psutil.cpu_count(logical=True) or 1)
+
+                raw = float(proc.cpu_percent(interval=None))
+                cpu_raw = f"{raw:.1f}"
+                cpu_norm = f"{raw / max(1, cores):.1f}"
+
+            held_mb = f"{self._ballast_held_mb_safe():.0f}"
 
             self.mem_label.setText(
-                f"RSS: {rss} MB | Ballast: {held} MB | Avail: {avail} MB | "
-                f"CPU(proc): {cpu_raw:.1f}% (raw) | {cpu_norm:.1f}% (norm/{cores} cores)"
+                f"RSS: {rss_mb} MB | Ballast: {held_mb} MB | Avail: {avail_mb} MB | "
+                f"CPU(proc): {cpu_raw}% raw | {cpu_norm}% norm/{cores} cores"
             )
+
         except Exception:
             self.mem_label.setText("RSS: ? MB")
-    # ---------------- param editor ----------------
+
+    # ------------------------------------------------------------------
+    # Param editor
+    # ------------------------------------------------------------------
 
     def _clear_param_rows(self):
         while self.params_form.rowCount():
@@ -1169,6 +1348,7 @@ class MelodyGUI(QMainWindow):
 
     def select_block_for_edit(self, stack_name: str):
         ti = self.current_track_index()
+
         if ti < 0:
             self.clear_param_editor()
             return
@@ -1178,10 +1358,13 @@ class MelodyGUI(QMainWindow):
 
         if stack_name == "instruments":
             bi_idx = self.inst_list.currentRow()
+
             if 0 <= bi_idx < len(self.seq.tracks[ti].instruments):
                 blk_instance = self.seq.tracks[ti].instruments[bi_idx]
+
         elif stack_name == "fx":
             bi_idx = self.fx_list.currentRow()
+
             if 0 <= bi_idx < len(self.seq.tracks[ti].fx):
                 blk_instance = self.seq.tracks[ti].fx[bi_idx]
 
@@ -1196,6 +1379,7 @@ class MelodyGUI(QMainWindow):
         self._clear_param_rows()
 
         schema = block_params_schema(block_name)
+
         if not schema:
             self.params_form.addRow(QLabel("(No params)"), QLabel(""))
             return
@@ -1208,15 +1392,13 @@ class MelodyGUI(QMainWindow):
             ptype = spec.get("type", "float")
             default = spec.get("default")
 
-            # --- bool ---
             if ptype == "bool":
                 w = QCheckBox()
                 w.setChecked(bool(params.get(key)))
-                w.stateChanged.connect(lambda _=0, k=key, wid=w: self._set_param(k, wid.isChecked()))
+                w.toggled.connect(lambda checked, k=key: self._set_param(k, bool(checked)))
                 self.params_form.addRow(QLabel(key), w)
                 continue
 
-            # --- str ---
             if ptype == "str":
                 w = QLineEdit()
                 w.setText(str(params.get(key, default) or ""))
@@ -1224,21 +1406,23 @@ class MelodyGUI(QMainWindow):
                 self.params_form.addRow(QLabel(key), w)
                 continue
 
-            # --- choice ---
             if ptype == "choice":
                 w = QComboBox()
                 choices = list(spec.get("choices", []))
+
                 for c in choices:
                     w.addItem(str(c))
+
                 cur = str(params.get(key, default))
+
                 if cur in [str(x) for x in choices]:
                     w.setCurrentText(cur)
+
                 w.currentTextChanged.connect(lambda val, k=key: self._set_param(k, val))
                 self.params_form.addRow(QLabel(key), w)
                 continue
 
-            # --- numeric: int/float -> slider + spinbox ---
-            is_int = (ptype == "int")
+            is_int = ptype == "int"
             mn, mx, step, steps_int = _slider_steps_for_spec(spec, is_int=is_int)
 
             row = QWidget()
@@ -1266,16 +1450,15 @@ class MelodyGUI(QMainWindow):
                 spn.setSingleStep(float(spec.get("step", 0.01)))
                 spn.setFixedWidth(110)
 
-            # init value
             cur_v = params.get(key, default)
             cur_v = float(cur_v if cur_v is not None else (mn + mx) * 0.5)
             cur_v = float(np.clip(cur_v, mn, mx))
 
-            # block signals while we set defaults
             sld.blockSignals(True)
             spn.blockSignals(True)
 
             sld.setValue(_value_to_slider(cur_v, mn, step, steps_int))
+
             if is_int:
                 spn.setValue(int(round(cur_v)))
             else:
@@ -1284,28 +1467,48 @@ class MelodyGUI(QMainWindow):
             sld.blockSignals(False)
             spn.blockSignals(False)
 
-            # wire: slider -> spin -> params
-            def on_slider(val, k=key, slider=sld, spin=spn, mn_=mn, step_=step, is_int_=is_int):
+            sld.sliderPressed.connect(self._begin_param_drag)
+            sld.sliderReleased.connect(self._end_param_drag)
+
+            def on_slider(
+                val,
+                k=key,
+                spin=spn,
+                mn_=mn,
+                step_=step,
+                is_int_=is_int,
+            ):
                 v = _slider_to_value(int(val), mn_, step_)
+
                 if is_int_:
                     v = int(round(v))
                     spin.blockSignals(True)
                     spin.setValue(v)
                     spin.blockSignals(False)
-                    self._set_param(k, v)  # now debounced internally
+                    self._set_param(k, v)
                 else:
                     spin.blockSignals(True)
                     spin.setValue(float(v))
                     spin.blockSignals(False)
-                    self._set_param(k, float(v))  # now debounced internally
+                    self._set_param(k, float(v))
 
-            def on_spin(val, k=key, slider=sld, mn_=mn, step_=step, steps_=steps_int, is_int_=is_int):
-                v = float(val)
-                v = float(np.clip(v, mn_, mx))
+            def on_spin(
+                val,
+                k=key,
+                slider=sld,
+                mn_=mn,
+                mx_=mx,
+                step_=step,
+                steps_=steps_int,
+                is_int_=is_int,
+            ):
+                v = float(np.clip(float(val), mn_, mx_))
+
                 slider.blockSignals(True)
                 slider.setValue(_value_to_slider(v, mn_, step_, steps_))
                 slider.blockSignals(False)
-                self._set_param(k, int(round(v)) if is_int_ else float(v))  # now debounced internally
+
+                self._set_param(k, int(round(v)) if is_int_ else float(v))
 
             sld.valueChanged.connect(on_slider)
             spn.valueChanged.connect(on_spin)
@@ -1315,108 +1518,122 @@ class MelodyGUI(QMainWindow):
 
             self.params_form.addRow(QLabel(key), row)
 
+    def _begin_param_drag(self):
+        self._param_dragging = True
+
+    def _end_param_drag(self):
+        self._param_dragging = False
+        self._mark_dirty_and_restart_from_playhead(full_later=True)
+
+        if self.audio.is_playing:
+            self.audio.request_full_rerender(immediate=False)
+
     def _set_param(self, key: str, value: Any):
         if not self._editing:
             return
 
         ti, stack_name, bi = self._editing
-        if not (0 <= ti < len(self.seq.tracks)):
-            return
-        tr = self.seq.tracks[ti]
+        chain_kind = "instrument" if stack_name == "instruments" else "fx"
 
-        if stack_name == "instruments":
-            if not (0 <= bi < len(tr.instruments)):
-                return
-            blk = tr.instruments[bi]
+        self._set_block_param_fast(
+            track_i=ti,
+            chain_kind=chain_kind,
+            block_i=bi,
+            param_name=key,
+            value=value,
+            live=True,
+        )
+
+    def _set_block_param_fast(
+        self,
+        *,
+        track_i: int,
+        chain_kind: str,
+        block_i: int,
+        param_name: str,
+        value: Any,
+        live: bool = True,
+    ):
+        if not (0 <= int(track_i) < len(self.seq.tracks)):
+            return
+
+        track = self.seq.tracks[int(track_i)]
+
+        if chain_kind == "instrument":
+            chain = track.instruments
+        elif chain_kind == "fx":
+            chain = track.fx
         else:
-            if not (0 <= bi < len(tr.fx)):
-                return
-            blk = tr.fx[bi]
+            return
+
+        if not (0 <= int(block_i) < len(chain)):
+            return
 
         with self._param_lock:
-            blk.params[key] = value
+            chain[int(block_i)].params[str(param_name)] = value
 
-        self._schedule_dirty_restart()
+        if live:
+            self._mark_dirty_and_restart_from_playhead(full_later=not self._param_dragging)
 
-    def _mark_dirty_and_restart_from_playhead(self):
-        self._render_dirty = True
-        with self._audio_lock:
-            self._play_pos = self._start_sample_for_current_locked()
+    # ------------------------------------------------------------------
+    # MIDI import
+    # ------------------------------------------------------------------
 
-    # ---------------- audio normalization ----------------
+    def _ticks_to_step_len(
+        self,
+        start_tick: int,
+        end_tick: int,
+        ppq: int,
+        steps_per_beat: float,
+    ) -> Tuple[int, int]:
+        start_beats = float(start_tick) / float(ppq)
+        end_beats = float(end_tick) / float(ppq)
 
-    def _normalize_audio_for_sd(self, buf):
-        if buf is None or getattr(buf, "data", None) is None:
-            return buf
+        s0 = int(round(start_beats * steps_per_beat))
+        s1 = int(round(end_beats * steps_per_beat))
 
-        x = np.asarray(buf.data)
-        if x.dtype != np.float32:
-            x = x.astype(np.float32, copy=False)
+        if s1 <= s0:
+            s1 = s0 + 1
 
-        if x.ndim == 1:
-            x = x[:, None]
+        return s0, int(s1 - s0)
 
-        if x.ndim == 2 and x.shape[0] in (1, 2) and x.shape[1] > x.shape[0]:
-            x = x.T
-
-        x = ensure_stereo(x)
-
-        if x.ndim == 2 and x.shape[0] == 2 and x.shape[1] > 2:
-            x = x.T
-
-        if x.ndim != 2:
-            x = np.zeros((0, 2), dtype=np.float32)
-        else:
-            if x.shape[1] == 1:
-                x = np.repeat(x, 2, axis=1)
-            elif x.shape[1] >= 2:
-                x = x[:, :2]
-
-        x = np.ascontiguousarray(x, dtype=np.float32)
-        buf.data = x
-        return buf
-
-    def _parse_midi_to_notes_and_bars(self, path: str) -> Tuple[
-        Optional[float], int, List[Tuple[int, int, Tuple[str, int]]]]:
-        """
-        Returns: (bpm_or_None, bars_needed, notes)
-        notes: list[(start_step, length_steps, (note_name, octave))]
-
-        Quantizes MIDI ticks into your sequencer steps:
-          steps_per_beat = steps_per_bar / 4  (assumes 4/4 grid)
-        Bars auto-expand to fit the imported MIDI.
-        """
+    def _parse_midi_to_notes_and_bars(
+        self,
+        path: str,
+    ) -> Tuple[Optional[float], int, List[Tuple[int, int, Tuple[str, int]]]]:
         try:
-            import mido  # pip install mido
+            import mido
         except Exception:
             raise RuntimeError("Missing dependency: mido. Install with: pip install mido")
 
         mid = mido.MidiFile(path)
         ppq = int(getattr(mid, "ticks_per_beat", 480) or 480)
 
-        # Try to read BPM from MIDI tempo (optional)
         bpm: Optional[float] = None
         tempo_us: Optional[int] = None
+
         for tr in mid.tracks:
             for msg in tr:
                 if getattr(msg, "is_meta", False) and msg.type == "set_tempo":
                     tempo_us = int(msg.tempo)
                     break
+
             if tempo_us is not None:
                 break
+
         if tempo_us is not None and tempo_us > 0:
             bpm = 60_000_000.0 / float(tempo_us)
 
         steps_per_bar = int(getattr(self.seq, "steps_per_bar", 16) or 16)
-        steps_per_beat = float(steps_per_bar) / 4.0  # 4/4 assumption
+        steps_per_beat = float(steps_per_bar) / 4.0
 
-        # Collect note_on/note_off pairs
-        active = {}  # (track_i, channel, note) -> start_tick
+        active: dict[tuple[int, int, int], int] = {}
         out_notes: List[Tuple[int, int, Tuple[str, int]]] = []
         max_end_step = 0
 
         for track_i, tr in enumerate(mid.tracks):
             abs_tick = 0
+
             for msg in tr:
                 abs_tick += int(getattr(msg, "time", 0) or 0)
 
@@ -1424,6 +1641,7 @@ class MelodyGUI(QMainWindow):
                     continue
 
                 mtype = getattr(msg, "type", "")
+
                 if mtype not in ("note_on", "note_off"):
                     continue
 
@@ -1433,62 +1651,60 @@ class MelodyGUI(QMainWindow):
 
                 key = (track_i, ch, note)
 
-                is_on = (mtype == "note_on" and vel > 0)
-                is_off = (mtype == "note_off" or (mtype == "note_on" and vel == 0))
+                is_on = mtype == "note_on" and vel > 0
+                is_off = mtype == "note_off" or (mtype == "note_on" and vel == 0)
 
                 if is_on:
-                    # If already active, close it (avoid stuck notes)
                     if key in active:
                         start_tick = active.pop(key)
-                        start_beats = float(start_tick) / float(ppq)
-                        end_beats = float(abs_tick) / float(ppq)
-                        s0 = int(round(start_beats * steps_per_beat))
-                        s1 = int(round(end_beats * steps_per_beat))
-                        if s1 <= s0:
-                            s1 = s0 + 1
-                        pitch = midi_to_note_oct(note)  # uses your existing helper
-                        out_notes.append((s0, int(s1 - s0), pitch))
-                        max_end_step = max(max_end_step, s1)
+                        s0, ln = self._ticks_to_step_len(start_tick, abs_tick, ppq, steps_per_beat)
+                        pitch = midi_to_note_oct(note)
+                        out_notes.append((s0, ln, pitch))
+                        max_end_step = max(max_end_step, s0 + ln)
+
                     active[key] = abs_tick
 
                 elif is_off:
                     if key not in active:
                         continue
+
                     start_tick = active.pop(key)
-                    start_beats = float(start_tick) / float(ppq)
-                    end_beats = float(abs_tick) / float(ppq)
-                    s0 = int(round(start_beats * steps_per_beat))
-                    s1 = int(round(end_beats * steps_per_beat))
-                    if s1 <= s0:
-                        s1 = s0 + 1
+                    s0, ln = self._ticks_to_step_len(start_tick, abs_tick, ppq, steps_per_beat)
                     pitch = midi_to_note_oct(note)
-                    out_notes.append((s0, int(s1 - s0), pitch))
-                    max_end_step = max(max_end_step, s1)
+                    out_notes.append((s0, ln, pitch))
+                    max_end_step = max(max_end_step, s0 + ln)
 
         inferred_end_step = max_end_step if out_notes else 0
-
-        # bars needed to fit end step
         bars_needed = max(1, int(math.ceil(float(max(1, inferred_end_step)) / float(steps_per_bar))))
 
-        # Clamp notes into that range
         total_steps = bars_needed * steps_per_bar
         cleaned: List[Tuple[int, int, Tuple[str, int]]] = []
+
         for s0, ln, pitch in out_notes:
             s0 = int(max(0, min(total_steps - 1, int(s0))))
             ln = int(max(1, int(ln)))
+
             if s0 + ln > total_steps:
                 ln = max(1, total_steps - s0)
+
             cleaned.append((s0, ln, pitch))
 
         cleaned.sort(key=lambda x: (x[0], x[2][1], x[2][0]))
         return bpm, bars_needed, cleaned
 
     def on_import_midi(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Import MIDI", "", "MIDI Files (*.mid *.midi)")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import MIDI",
+            "",
+            "MIDI Files (*.mid *.midi)",
+        )
+
         if not path:
             return
 
         ti = self.current_track_index()
+
         if ti < 0:
             ti = 0
 
@@ -1499,142 +1715,66 @@ class MelodyGUI(QMainWindow):
             return
 
         with self._param_lock:
-            # adopt BPM if present
             if bpm is not None and bpm > 1:
                 self.seq.bpm = float(bpm)
 
-            # resize bars to fit
             self.seq.bars = int(max(1, bars_needed))
             self.seq.ensure()
 
-            # replace notes on current track
             while len(self.seq.notes) <= ti:
                 self.seq.notes.append([])
+
             self.seq.notes[ti] = []
 
             for s0, ln, pitch in notes:
                 self.seq.add_note(ti, int(s0), pitch, int(ln))
 
-        # sync Bars spinbox
+            try:
+                self.seq.touch()
+            except Exception:
+                pass
+
         self.bars_spin.blockSignals(True)
         self.bars_spin.setValue(int(self.seq.bars))
         self.bars_spin.blockSignals(False)
 
-        # keep playhead valid
         if self._start_step >= self.seq.total_steps():
             self._start_step = max(0, self.seq.total_steps() - 1)
 
         self.rebuild_roll(grid=True, notes=True)
         self._mark_dirty_and_restart_from_playhead()
 
-    # ---------------- playback core ----------------
+    # ------------------------------------------------------------------
+    # Transport
+    # ------------------------------------------------------------------
 
-    def _start_sample_for_current_locked(self) -> int:
-        buf = self._render_cache
-        if buf is None or buf.data is None or buf.data.size == 0:
-            return 0
-
-        step_samples = int(round(self.seq.step_seconds() * self.seq.sr))
-        if step_samples <= 0:
-            return 0
-
-        start_sample = int(self._start_step) * step_samples
-        n = int(buf.data.shape[0])
-
-        if n <= 0:
-            return 0
-
-        return max(0, min(n - 1, start_sample))
-
-    def _swap_render_keep_pos_locked(self, new_buf, keep_pos: int):
-        new_buf = self._normalize_audio_for_sd(new_buf)
-        self._render_cache = new_buf
-        self._play_pos = int(max(0, min(int(new_buf.data.shape[0]), keep_pos)))
-        self._render_gen += 1
-
-    def _swap_render_locked(self, new_buf):
-        """
-        Backwards-compatible helper.
-        Replace the current render cache and set play_pos to the current start_step sample.
-        """
-        new_buf = self._normalize_audio_for_sd(new_buf)
-        self._render_cache = new_buf
-        self._play_pos = self._start_sample_for_current_locked()
-        self._render_gen += 1
-
-    def _render_tail_and_patch(self):
-        with self._audio_lock:
-            old = self._render_cache
-            pos = int(self._play_pos)
-
-        if old is None or old.data is None or old.data.size == 0:
-            return self._render_full()
-
-        n = int(old.data.shape[0])
-        pos = max(0, min(n, pos))
-
-        # Warmup so FX has history (tweak 0.25–1.0s)
-        warmup = int(0.50 * self.seq.sr)
-        start = max(0, pos - warmup)
-
-        with self._param_lock:
-            tail = self.seq.render_from(start)
-
-        tail = self._normalize_audio_for_sd(tail)
-
-        # Drop warmup portion so tail aligns at 'pos'
-        drop = pos - start
-        tail_data = tail.data[drop:] if drop > 0 else tail.data
-
-        # Build new buffer with one allocation (copy full old once)
-        new_data = old.data.copy()
-        need = new_data.shape[0] - pos
-        if need > 0 and tail_data.shape[0] > 0:
-            new_data[pos:pos + need] = tail_data[:need]
-
-        return AudioBuffer(new_data.astype(np.float32, copy=False), int(self.seq.sr))
-
-    def _render_full(self):
-        with self._param_lock:
-            buf = self.seq.render()
-        return self._normalize_audio_for_sd(buf)
-
-    def _post_error(self, title: str, body: str):
-        app = QApplication.instance()
-        if app is None:
-            return
-        def _show():
-            QMessageBox.critical(self, title, body)
-        app.postEvent(app, _CallableEvent(_show))
-
-    # ---------------- transport ----------------
     def on_bars_changed(self, bars: int):
         bars = int(max(1, bars))
 
-        # Keep audio thread safe and prevent partial edits mid-render
         with self._param_lock:
-            old_steps = int(self.seq.total_steps())
             self.seq.bars = bars
             self.seq.ensure()
             new_steps = int(self.seq.total_steps())
 
-            # If your Sequence clamps notes automatically in ensure(), you're done.
-            # If not, this clamp prevents notes from living past the new end.
             for ti in range(len(self.seq.notes)):
                 kept = []
+
                 for ev in self.seq.notes[ti]:
                     if int(ev.start_step) < new_steps:
-                        # clamp length so it doesn't run past end
                         max_len = max(1, new_steps - int(ev.start_step))
                         ev.length_steps = int(min(int(ev.length_steps), max_len))
                         kept.append(ev)
+
                 self.seq.notes[ti] = kept
 
-        # Keep playhead valid
+            try:
+                self.seq.touch()
+            except Exception:
+                pass
+
         if self._start_step >= self.seq.total_steps():
             self._start_step = max(0, self.seq.total_steps() - 1)
 
-        # Rebuild UI + rerender from playhead
         self.rebuild_roll()
         self._mark_dirty_and_restart_from_playhead()
 
@@ -1646,188 +1786,98 @@ class MelodyGUI(QMainWindow):
             self.btn_play_toggle.setText("▶")
             self.on_pause()
 
-    def on_stop(self):
-        self.on_pause()
-        self._set_start_step(self._start_step)
-
     def on_play(self):
-        if self._playing:
-            return
-
-        self._playing = True
-        self._stop_evt.clear()
+        start_sample = int(self._start_step * self._step_samples())
+        self.audio.start(start_sample=start_sample, loop=bool(self._loop))
         self._ui_timer.start()
 
-        def run_audio():
-            stream: Optional[sd.OutputStream] = None
-            try:
-                # Initial render
-                buf0 = self._render_full()
-                with self._audio_lock:
-                    self._swap_render_locked(buf0)
-                self._render_dirty = False
-
-                def callback(outdata, frames, time_info, status):
-                    outdata[:] = 0.0
-
-                    if self._stop_evt.is_set():
-                        raise sd.CallbackStop
-
-                    # Snapshot shared state once (minimize lock time)
-                    with self._audio_lock:
-                        buf = self._render_cache
-                        pos = int(self._play_pos)
-                        gen = int(self._render_gen)
-
-                    if buf is None or buf.data is None:
-                        raise sd.CallbackStop
-
-                    x = buf.data
-                    if x.ndim != 2 or x.shape[1] != 2:
-                        raise sd.CallbackStop
-
-                    n = int(x.shape[0])
-                    if n <= 0:
-                        raise sd.CallbackStop
-
-                    end = pos + frames
-                    if end <= n:
-                        outdata[:] = x[pos:end]
-                        pos = end
-                    else:
-                        if not self._loop:
-                            avail = max(0, n - pos)
-                            if avail > 0:
-                                outdata[:avail] = x[pos:n]
-                            raise sd.CallbackStop
-
-                        first = max(0, n - pos)
-                        if first > 0:
-                            outdata[:first] = x[pos:n]
-
-                        with self._audio_lock:
-                            start_pos = int(self._start_sample_for_current_locked())
-
-                        # HARD CLAMP: must be inside [0, n-1]
-                        if start_pos < 0:
-                            start_pos = 0
-                        elif start_pos >= n:
-                            start_pos = 0
-
-                        remain = frames - first
-                        if remain <= 0:
-                            pos = start_pos
-                        else:
-                            p = start_pos
-                            filled = first
-                            while filled < frames:
-                                # ensure p always valid
-                                if p < 0 or p >= n:
-                                    p = start_pos
-
-                                take = min(frames - filled, n - p)
-                                if take <= 0:
-                                    # if somehow we still can't take, reset to loop start and try once more
-                                    p = start_pos
-                                    take = min(frames - filled, n - p)
-                                    if take <= 0:
-                                        # give up safely (silence remainder) instead of infinite loop
-                                        break
-                                outdata[filled:filled + take] = x[p:p + take]
-                                filled += take
-                                p += take
-                                if p >= n:
-                                    p = start_pos
-                            pos = p
-
-                    with self._audio_lock:
-                        if self._render_gen == gen and self._render_cache is buf:
-                            self._play_pos = int(pos)
-
-                stream = sd.OutputStream(
-                    samplerate=int(self.seq.sr),
-                    channels=2,
-                    dtype="float32",
-                    callback=callback,
-                    blocksize=0,
-                    latency="low",
-                )
-                stream.start()
-
-                # Render/patch loop (kept out of callback)
-                while self._playing and not self._stop_evt.is_set():
-                    if self._render_dirty:
-                        with self._audio_lock:
-                            keep_pos = int(self._play_pos)
-
-                        new_buf = self._render_tail_and_patch()
-
-                        with self._audio_lock:
-                            self._swap_render_keep_pos_locked(new_buf, keep_pos)
-
-                        self._render_dirty = False
-
-                    time.sleep(0.01)
-
-            except Exception:
-                import traceback
-                self._post_error("Play failed", traceback.format_exc())
-            finally:
-                try:
-                    if stream is not None:
-                        stream.stop()
-                        stream.close()
-                except Exception:
-                    pass
-
-                self._stop_evt.set()
-                self._playing = False
-
-        # ✅ YOU MUST START THE AUDIO THREAD
-        self._audio_thread = threading.Thread(target=run_audio, daemon=True)
-        self._audio_thread.start()
-
     def on_pause(self):
-        self._playing = False
-        self._stop_evt.set()
+        self.audio.pause()
         self._ui_timer.stop()
 
+    def on_stop(self):
+        self.on_pause()
+
+        self.btn_play_toggle.blockSignals(True)
+        self.btn_play_toggle.setChecked(False)
+        self.btn_play_toggle.setText("▶")
+        self.btn_play_toggle.blockSignals(False)
+
+        self.audio.stop()
+        self._set_start_step(self._start_step)
+        self.roll.set_playhead_step(self._start_step)
+
     def _tick_ui(self):
-        if not self._playing:
+        if not self.audio.is_playing:
+            if self.btn_play_toggle.isChecked():
+                self.btn_play_toggle.blockSignals(True)
+                self.btn_play_toggle.setChecked(False)
+                self.btn_play_toggle.setText("▶")
+                self.btn_play_toggle.blockSignals(False)
+
             return
-        step_samples = int(round(self.seq.step_seconds() * self.seq.sr))
+
+        step_samples = int(self._step_samples())
+
         if step_samples <= 0:
             return
-        with self._audio_lock:
-            pos = int(self._play_pos)
+
+        pos = int(self.audio.position_samples)
         step_float = float(pos) / float(step_samples)
         self.roll.set_playhead_step(step_float)
         self._update_mem_label()
 
-    # ---------------- export ----------------
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
 
     def on_export(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Export WAV", "out.wav", "WAV Files (*.wav)")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export WAV",
+            "out.wav",
+            "WAV Files (*.wav)",
+        )
+
         if not path:
             return
+
         try:
-            with self._param_lock:
-                buf = self.seq.render()
-            buf = self._normalize_audio_for_sd(buf)
-            write_wav(path, buf)
+            self.audio.export_wav(path)
             QMessageBox.information(self, "Export Successful", f"Audio exported to {path}")
         except Exception as e:
             QMessageBox.critical(self, "Export failed", str(e))
 
+    # ------------------------------------------------------------------
+    # Close
+    # ------------------------------------------------------------------
+
+    def closeEvent(self, event):
+        try:
+            self.audio.shutdown()
+        except Exception:
+            pass
+
+        try:
+            self._cpu_ballast.stop()
+        except Exception:
+            pass
+
+        self._ballast_release_safe()
+        super().closeEvent(event)
+
 
 def main():
     app = QApplication(sys.argv)
+
     catcher = _EventCatcher()
     app.installEventFilter(catcher)
+    app._melody_event_catcher = catcher  # keep reference alive
 
     w = MelodyGUI()
     w.resize(1450, 850)
     w.show()
+
     raise SystemExit(app.exec())
 
 

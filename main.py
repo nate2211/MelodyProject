@@ -1,10 +1,14 @@
-import sys
 import argparse
+import sys
 
 from pipeline import Sequence, Track, BlockInstance, write_wav
-import sounds  # registers blocks
 
-def cli_main():
+import sounds
+import realism
+import melody_humanize
+
+
+def cli_main() -> None:
     parser = argparse.ArgumentParser(description="MelodyProject Modular")
     parser.add_argument("--gui", action="store_true", help="Launch GUI mode")
     parser.add_argument("--out", default="out.wav", help="Output file for CLI mode")
@@ -13,19 +17,39 @@ def cli_main():
     if args.gui:
         from PyQt6.QtWidgets import QApplication
         from gui import MelodyGUI
+
         app = QApplication(sys.argv)
         ex = MelodyGUI()
         ex.show()
-        sys.exit(app.exec())
+        raise SystemExit(app.exec())
 
     # CLI example: layer synth + guitar
-    seq = Sequence()
+    seq = Sequence(sr=48000, bpm=120.0, steps_per_bar=16, bars=2)
+
     seq.tracks.append(
         Track(
             name="Layered",
             instruments=[
-                BlockInstance("synth_keys", {"wave": "saw", "amp": 0.10, "attack": 0.002, "release": 0.03, "pan": -0.2}),
-                BlockInstance("guitar_pluck", {"amp": 0.20, "decay": 0.988, "tone": 0.6, "pick_ms": 6.0, "pan": 0.2}),
+                BlockInstance(
+                    "synth_keys",
+                    {
+                        "wave": "saw",
+                        "amp": 0.10,
+                        "attack": 0.002,
+                        "release": 0.03,
+                        "pan": -0.2,
+                    },
+                ),
+                BlockInstance(
+                    "guitar_pluck",
+                    {
+                        "amp": 0.20,
+                        "decay": 0.988,
+                        "tone": 0.6,
+                        "pick_ms": 6.0,
+                        "pan": 0.2,
+                    },
+                ),
             ],
             fx=[
                 BlockInstance("gain", {"gain_db": -6.0}),
@@ -37,17 +61,17 @@ def cli_main():
         )
     )
 
-    seq.ensure_grid()
-    # a few notes
-    seq.set_note(0, 0, ("C", 4))
-    seq.set_note(0, 4, ("E", 4))
-    seq.set_note(0, 8, ("G", 4))
-    seq.set_note(0, 12, ("C", 5))
+    seq.ensure()
+
+    seq.add_note(0, 0, ("C", 4), 2)
+    seq.add_note(0, 4, ("E", 4), 2)
+    seq.add_note(0, 8, ("G", 4), 2)
+    seq.add_note(0, 12, ("C", 5), 4)
 
     print(f"Rendering to {args.out}...")
-    buf = seq.render()
-    write_wav(args.out, buf)
+    write_wav(args.out, seq.render())
     print("Done.")
+
 
 if __name__ == "__main__":
     cli_main()
