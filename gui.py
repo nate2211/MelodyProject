@@ -693,9 +693,9 @@ class MelodyGUI(QMainWindow):
             self.seq,
             blocksize=512,
             latency="low",
-            preview_seconds=8.0,
-            preview_debounce_ms=35,
-            full_debounce_ms=650,
+            preview_seconds=2.0,
+            preview_debounce_ms=60,
+            full_debounce_ms=1000,
             on_error=self._post_error,
         )
 

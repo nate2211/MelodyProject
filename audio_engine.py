@@ -249,14 +249,13 @@ class AudioEngine:
         with self._state_lock:
             playing = bool(self._playing)
             pos = int(self._play_pos)
-            loop = bool(self._loop)
 
         if not playing:
             return
 
         t0 = time.perf_counter()
 
-        if kind == "preview" and not loop:
+        if kind == "preview":
             start = max(0, pos)
             max_samples = int(round(self.preview_seconds * int(self.seq.sr)))
             buf = self.seq.render_window(start, max_samples)
@@ -269,8 +268,6 @@ class AudioEngine:
         buf = normalize_for_playback(buf, peak=0.98, only_if_over=True)
         elapsed = time.perf_counter() - t0
 
-        # If another slider movement happened while this render was running,
-        # do not swap stale audio into playback.
         with self._cond:
             if request_id != self._request_id and kind == "preview":
                 return
@@ -285,7 +282,6 @@ class AudioEngine:
             self._last_render_kind = str(kind)
 
         self._open_stream_if_needed()
-
     # ------------------------------------------------------------------
     # sounddevice
     # ------------------------------------------------------------------
