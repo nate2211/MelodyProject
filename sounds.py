@@ -2230,4 +2230,5 @@ BLOCKS.register("lowpass", OnePoleLP)
 BLOCKS.register("highpass", Highpass)
 BLOCKS.register("bandpass", Bandpass)
 BLOCKS.register("softclip", SoftClip)
+
 BLOCKS.register("sound_polish", SoundPolish)
