@@ -378,7 +378,7 @@ class SequenceSnapshot:
 # Render cache
 # ============================================================================
 
-_RENDER_CACHE_MAX_ITEMS = int(os.getenv("MELODY_RENDER_CACHE_ITEMS", "96"))
+_RENDER_CACHE_MAX_ITEMS = int(os.getenv("MELODY_RENDER_CACHE_ITEMS", "256"))
 _RENDER_CACHE_LOCK = threading.RLock()
 _RENDER_CACHE: "OrderedDict[str, np.ndarray]" = OrderedDict()
 
