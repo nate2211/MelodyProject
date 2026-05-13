@@ -21,19 +21,22 @@ except Exception:
 
     def ensure_stereo(x: Any) -> np.ndarray:
         a = np.asarray(x, dtype=np.float32)
+
         if a.ndim == 0:
             a = np.zeros((0, 2), dtype=np.float32)
-        if a.ndim == 1:
+        elif a.ndim == 1:
             a = a[:, None]
+
         if a.shape[1] == 1:
             a = np.repeat(a, 2, axis=1)
         elif a.shape[1] > 2:
             a = a[:, :2]
-        return np.asarray(a, dtype=np.float32)
+
+        return np.ascontiguousarray(a.astype(np.float32, copy=False))
 
 
 # ============================================================================
-# Audio helpers
+# Audio buffer + IO helpers
 # ============================================================================
 
 @dataclass
@@ -62,10 +65,11 @@ def sanitize_audio(x: Any, *, ceiling: float = 0.995) -> np.ndarray:
 
 def normalize_for_playback(buf: AudioBuffer, *, peak: float = 0.98, only_if_over: bool = True) -> AudioBuffer:
     x = sanitize_audio(buf.data, ceiling=1.25)
-    mx = float(np.max(np.abs(x))) if x.size else 0.0
-    peak = float(max(0.05, peak))
+    peak = float(max(0.05, min(1.0, peak)))
 
-    if mx > 1e-9 and ((not only_if_over) or mx > peak):
+    mx = float(np.max(np.abs(x))) if x.size else 0.0
+
+    if mx > 1.0e-9 and ((not only_if_over) or mx > peak):
         x = x * (peak / mx)
 
     return AudioBuffer(sanitize_audio(x, ceiling=0.995), int(buf.sr))
@@ -87,8 +91,10 @@ def _pcm_to_float(raw: bytes, channels: int, sampwidth: int) -> np.ndarray:
     if sampwidth == 1:
         a = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
         a = (a - 128.0) / 128.0
+
     elif sampwidth == 2:
         a = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+
     elif sampwidth == 3:
         b = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
         a32 = (
@@ -99,8 +105,10 @@ def _pcm_to_float(raw: bytes, channels: int, sampwidth: int) -> np.ndarray:
         sign = a32 & 0x800000
         a32 = a32 - (sign << 1)
         a = a32.astype(np.float32) / 8388608.0
+
     elif sampwidth == 4:
         a = np.frombuffer(raw, dtype="<i4").astype(np.float32) / 2147483648.0
+
     else:
         raise ValueError(f"Unsupported WAV sample width: {sampwidth}")
 
@@ -154,7 +162,7 @@ def read_wav(path: str | os.PathLike[str], *, target_sr: Optional[int] = None) -
 
 
 # ============================================================================
-# Block framework
+# Blocks framework
 # ============================================================================
 
 class BaseBlock:
@@ -172,8 +180,10 @@ class Registry:
 
     def register(self, name: str, cls: type[BaseBlock]) -> None:
         key = str(name).strip().lower()
+
         if not key:
             raise ValueError("Block name cannot be empty")
+
         with self._lock:
             self._by_name[key] = cls
 
@@ -227,6 +237,7 @@ def register_block(*names: str):
 def _as_audio_buffer(x: Any, sr: int) -> AudioBuffer:
     if isinstance(x, AudioBuffer):
         return AudioBuffer(sanitize_audio(x.data), int(x.sr))
+
     return AudioBuffer(sanitize_audio(x), int(sr))
 
 
@@ -273,14 +284,22 @@ NOTE_TO_SEMI = {
 
 def midi_from_note(note: str, octave: int) -> int:
     key = str(note).strip().upper().replace("♯", "#").replace("♭", "B")
+
     if key not in NOTE_TO_SEMI:
         raise KeyError(f"Unknown note name: {note}")
+
     return int((int(octave) + 1) * 12 + NOTE_TO_SEMI[key])
 
 
 def hz_from_note(note: str, octave: int) -> float:
     midi = midi_from_note(note, octave)
     return 440.0 * (2.0 ** ((midi - 69) / 12.0))
+
+
+def note_from_midi(midi: int) -> Tuple[str, int]:
+    names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    midi = int(midi)
+    return names[midi % 12], (midi // 12) - 1
 
 
 # ============================================================================
@@ -347,7 +366,7 @@ class SequenceSnapshot:
 # Render cache
 # ============================================================================
 
-_RENDER_CACHE_MAX_ITEMS = int(os.getenv("MELODY_RENDER_CACHE_ITEMS", "64"))
+_RENDER_CACHE_MAX_ITEMS = int(os.getenv("MELODY_RENDER_CACHE_ITEMS", "96"))
 _RENDER_CACHE_LOCK = threading.RLock()
 _RENDER_CACHE: "OrderedDict[str, np.ndarray]" = OrderedDict()
 
@@ -365,10 +384,10 @@ def _stable_data(obj: Any) -> Any:
     if isinstance(obj, np.ndarray):
         return obj.tolist()
 
-    if isinstance(obj, (np.integer,)):
+    if isinstance(obj, np.integer):
         return int(obj)
 
-    if isinstance(obj, (np.floating,)):
+    if isinstance(obj, np.floating):
         return float(obj)
 
     if isinstance(obj, (str, int, float, bool)) or obj is None:
@@ -390,8 +409,10 @@ def clear_render_cache() -> None:
 def _cache_get(key: str) -> Optional[np.ndarray]:
     with _RENDER_CACHE_LOCK:
         x = _RENDER_CACHE.get(key)
+
         if x is None:
             return None
+
         _RENDER_CACHE.move_to_end(key)
         return x.copy()
 
@@ -411,13 +432,14 @@ def _track_key(
     start_sample: int,
     window_n: int,
     step_n: int,
+    render_tail_n: int,
 ) -> str:
     track = snap.tracks[track_i]
     notes = snap.notes[track_i] if track_i < len(snap.notes) else ()
 
     return _cache_hash(
         {
-            "type": "python_block_track_v5_wave_params",
+            "type": "melody_pipeline_track_v8_advanced_sound_base",
             "version": int(snap.version),
             "track_i": int(track_i),
             "sr": int(snap.sr),
@@ -427,10 +449,277 @@ def _track_key(
             "start_sample": int(start_sample),
             "window_n": int(window_n),
             "step_n": int(step_n),
+            "render_tail_n": int(render_tail_n),
             "track": track,
             "notes": notes,
         }
     )
+
+
+# ============================================================================
+# Utility DSP for pipeline base
+# ============================================================================
+
+def _db_to_gain(db: float) -> float:
+    return float(10.0 ** (float(db) / 20.0))
+
+
+def _safe_gain(value: Any, default: float = 1.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _fade_edges(x: np.ndarray, fade_n: int) -> np.ndarray:
+    y = ensure_stereo(x).astype(np.float32, copy=False)
+
+    if y.shape[0] <= 2 or fade_n <= 1:
+        return y
+
+    n = min(int(fade_n), y.shape[0] // 2)
+
+    if n <= 1:
+        return y
+
+    fade_in = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    fade_out = np.linspace(1.0, 0.0, n, dtype=np.float32)
+
+    y = y.copy()
+    y[:n] *= fade_in[:, None]
+    y[-n:] *= fade_out[:, None]
+
+    return y.astype(np.float32, copy=False)
+
+
+def _dc_block_stereo(x: np.ndarray, amount: float = 0.995) -> np.ndarray:
+    y = ensure_stereo(x).astype(np.float32, copy=False)
+
+    if y.shape[0] <= 1:
+        return y
+
+    amount = float(np.clip(amount, 0.90, 0.9999))
+    out = np.empty_like(y, dtype=np.float32)
+
+    x1_l = x1_r = 0.0
+    y1_l = y1_r = 0.0
+
+    for i in range(y.shape[0]):
+        xl = float(y[i, 0])
+        xr = float(y[i, 1])
+
+        yl = xl - x1_l + amount * y1_l
+        yr = xr - x1_r + amount * y1_r
+
+        out[i, 0] = yl
+        out[i, 1] = yr
+
+        x1_l, x1_r = xl, xr
+        y1_l, y1_r = yl, yr
+
+    return out.astype(np.float32, copy=False)
+
+
+def _soft_saturate(x: np.ndarray, drive: float = 1.0, ceiling: float = 0.98) -> np.ndarray:
+    y = ensure_stereo(x).astype(np.float32, copy=False)
+    drive = float(np.clip(drive, 0.05, 12.0))
+    ceiling = float(np.clip(ceiling, 0.05, 1.0))
+
+    y = np.tanh(y * drive).astype(np.float32)
+    mx = float(np.max(np.abs(y))) if y.size else 0.0
+
+    if mx > ceiling and mx > 1.0e-9:
+        y = y * (ceiling / mx)
+
+    return y.astype(np.float32, copy=False)
+
+
+def _onepole_lowpass_stereo(x: np.ndarray, sr: int, cutoff_hz: float, wet: float = 1.0) -> np.ndarray:
+    y = ensure_stereo(x).astype(np.float32, copy=False)
+    sr = int(max(1, sr))
+    cutoff_hz = float(np.clip(cutoff_hz, 20.0, sr * 0.45))
+    wet = float(np.clip(wet, 0.0, 1.0))
+
+    if wet <= 1.0e-8 or y.shape[0] <= 1:
+        return y
+
+    a = 1.0 - math.exp(-2.0 * math.pi * cutoff_hz / float(sr))
+    a = float(np.clip(a, 0.0, 1.0))
+
+    out = np.empty_like(y, dtype=np.float32)
+    state = y[0].copy()
+    out[0] = state
+
+    for i in range(1, y.shape[0]):
+        state = state + a * (y[i] - state)
+        out[i] = state
+
+    return ((1.0 - wet) * y + wet * out).astype(np.float32, copy=False)
+
+
+def _master_finish(x: np.ndarray, sr: int, *, common: Dict[str, Any]) -> np.ndarray:
+    y = ensure_stereo(x).astype(np.float32, copy=False)
+
+    if y.shape[0] <= 0:
+        return y
+
+    master_gain = float(common.get("master_gain", 1.0))
+    master_drive = float(common.get("master_drive", 1.04))
+    master_ceiling = float(common.get("master_ceiling", 0.98))
+    master_lowpass_hz = float(common.get("master_lowpass_hz", 20500.0))
+
+    y = _dc_block_stereo(y)
+    y *= master_gain
+
+    if master_lowpass_hz > 0:
+        y = _onepole_lowpass_stereo(y, int(sr), master_lowpass_hz, wet=0.35)
+
+    # Tiny glue stage. This makes layered synthetic sounds feel less separate
+    # without killing the block-specific timbre.
+    y = _soft_saturate(y, drive=master_drive, ceiling=master_ceiling)
+
+    return sanitize_audio(y, ceiling=master_ceiling)
+
+
+# ============================================================================
+# Param normalization
+# ============================================================================
+
+def _block_kind_safe(block_name: str) -> str:
+    try:
+        return str(getattr(BLOCKS.cls(block_name), "KIND", "fx")).lower()
+    except Exception:
+        return "fx"
+
+
+def _normalize_block_params(
+    block_name: str,
+    params: Dict[str, Any] | None,
+    *,
+    sr: int,
+    preview: bool,
+    track_index: int,
+    track_name: str,
+    block_index: int,
+    block_kind: str,
+    render_seed: int,
+    start_sample: int,
+) -> Dict[str, Any]:
+    """
+    This lets old CLI/demo names work with newer sound blocks.
+
+    Examples:
+    - gain_db -> gain
+    - time_ms -> delay_ms
+    - mix -> wet
+    - waveform -> wave
+    - amp/gain/master_gain are synchronized for instruments
+    """
+    p: Dict[str, Any] = dict(params or {})
+
+    p.setdefault("sr", int(sr))
+    p.setdefault("sample_rate", int(sr))
+    p.setdefault("preview", bool(preview))
+    p.setdefault("track_index", int(track_index))
+    p.setdefault("track_name", str(track_name))
+    p.setdefault("block_index", int(block_index))
+    p.setdefault("block_kind", str(block_kind))
+    p.setdefault("render_seed", int(render_seed))
+    p.setdefault("window_start_sample", int(start_sample))
+
+    # Gain aliases.
+    if "gain_db" in p and "gain" not in p:
+        p["gain"] = _db_to_gain(float(p["gain_db"]))
+    if "db" in p and "gain" not in p:
+        p["gain"] = _db_to_gain(float(p["db"]))
+
+    # Delay aliases.
+    if "time_ms" in p and "delay_ms" not in p:
+        p["delay_ms"] = p["time_ms"]
+    if "delay_time_ms" in p and "delay_ms" not in p:
+        p["delay_ms"] = p["delay_time_ms"]
+    if "mix" in p and "wet" not in p:
+        p["wet"] = p["mix"]
+
+    # Filter aliases.
+    if "cutoff" in p and "cutoff_hz" not in p:
+        p["cutoff_hz"] = p["cutoff"]
+
+    # Instrument aliases.
+    if "waveform" in p and "wave" not in p:
+        p["wave"] = p["waveform"]
+    if "wave" in p and "waveform" not in p:
+        p["waveform"] = p["wave"]
+
+    if block_kind == "instrument":
+        if "master_gain" in p and "amp" not in p:
+            p["amp"] = p["master_gain"]
+        if "gain" in p and "amp" not in p:
+            p["amp"] = p["gain"]
+        if "amp" in p and "gain" not in p:
+            p["gain"] = p["amp"]
+        if "amp" in p and "master_gain" not in p:
+            p["master_gain"] = p["amp"]
+
+    return p
+
+
+def _param_float(params: Dict[str, Any], *names: str, default: float = 0.0) -> float:
+    for name in names:
+        if name in params:
+            try:
+                return float(params[name])
+            except Exception:
+                pass
+    return float(default)
+
+
+def _instrument_tail_seconds(params: Dict[str, Any]) -> float:
+    """
+    Lets notes ring/release instead of being hard-cut at step length.
+    This is one of the biggest improvements for more identifiable instruments.
+    """
+    release = _param_float(params, "release", "release_seconds", default=0.10)
+    decay = _param_float(params, "decay", "body_decay", "pluck_decay", default=0.0)
+    reverb_mix = _param_float(params, "reverb_mix", default=0.0)
+    delay_wet = _param_float(params, "wet", "mix", default=0.0)
+    delay_ms = _param_float(params, "delay_ms", "time_ms", default=0.0)
+
+    tail = max(0.0, release)
+
+    if decay > 0.5:
+        tail = max(tail, min(2.5, decay * 0.35))
+
+    if reverb_mix > 0.01:
+        tail = max(tail, 0.75 + reverb_mix * 1.25)
+
+    if delay_wet > 0.01 and delay_ms > 0.0:
+        tail = max(tail, min(3.0, delay_ms / 1000.0 * 3.0))
+
+    return float(np.clip(tail, 0.0, 4.0))
+
+
+def _track_fx_tail_seconds(track: Track) -> float:
+    tail = 0.0
+
+    for fx in track.fx:
+        name = str(fx.name).lower()
+        p = dict(fx.params or {})
+
+        if name in {"delay", "echo"}:
+            delay_ms = _param_float(p, "delay_ms", "time_ms", "delay_time_ms", default=250.0)
+            feedback = _param_float(p, "feedback", default=0.25)
+            wet = _param_float(p, "wet", "mix", default=0.35)
+            if wet > 0.001:
+                tail = max(tail, min(5.0, (delay_ms / 1000.0) * (2.0 + 5.0 * feedback)))
+
+        if "reverb" in name or name in {"sound_polish", "polish"}:
+            mix = _param_float(p, "reverb_mix", "mix", default=0.0)
+            room = _param_float(p, "reverb_room", "room", default=0.5)
+            if mix > 0.001:
+                tail = max(tail, 0.75 + room * 1.75)
+
+    return float(np.clip(tail, 0.0, 5.0))
 
 
 # ============================================================================
@@ -466,7 +755,7 @@ class Sequence:
         return int(self.steps_per_bar) * int(self.bars)
 
     def step_seconds(self) -> float:
-        bpm = max(1e-6, float(self.bpm))
+        bpm = max(1.0e-6, float(self.bpm))
         return (4.0 * (60.0 / bpm)) / float(max(1, int(self.steps_per_bar)))
 
     def step_samples(self) -> int:
@@ -544,7 +833,7 @@ class Sequence:
                     pitch=pitch,
                     start_step=start_step,
                     length_steps=length_steps,
-                    velocity=velocity,
+                    velocity=float(np.clip(velocity, 0.0, 2.0)),
                 )
             )
 
@@ -635,6 +924,7 @@ class Sequence:
 
     def toggle_note_at(self, track_i: int, start_step: int, pitch: Tuple[str, int]) -> None:
         idx = self.find_note_starting_at(track_i, start_step, pitch)
+
         if idx is not None:
             self.remove_note(track_i, idx)
         else:
@@ -665,15 +955,80 @@ class Sequence:
 # Render engine
 # ============================================================================
 
-def _mix_into(dst: np.ndarray, src: np.ndarray, gain: float = 1.0) -> np.ndarray:
+def _mix_into(dst: np.ndarray, src: np.ndarray, gain: float = 1.0, *, dst_offset: int = 0) -> np.ndarray:
     if dst.size == 0:
         return dst
 
     src = ensure_stereo(src)
-    n = min(dst.shape[0], src.shape[0])
+    dst_offset = int(max(0, dst_offset))
+
+    if dst_offset >= dst.shape[0]:
+        return dst
+
+    n = min(dst.shape[0] - dst_offset, src.shape[0])
+
     if n > 0:
-        dst[:n] += src[:n] * float(gain)
+        dst[dst_offset:dst_offset + n] += src[:n] * float(gain)
+
     return dst
+
+
+def _make_note_payload(
+    snap: SequenceSnapshot,
+    ev: NoteEvent,
+    *,
+    track_i: int,
+    track_name: str,
+    note_i: int,
+    inst_i: int,
+    freq: float,
+    midi: int,
+    duration_s: float,
+    hold_s: float,
+    start_sample_abs: int,
+    step_s: float,
+    step_n: int,
+    render_seed: int,
+) -> Dict[str, Any]:
+    note, octv = ev.pitch
+    velocity = float(np.clip(ev.velocity, 0.0, 2.0))
+
+    return {
+        "freq": float(freq),
+        "hz": float(freq),
+        "midi": int(midi),
+        "note": str(note),
+        "note_name": str(note),
+        "octave": int(octv),
+        "pitch": (str(note), int(octv)),
+
+        "duration": float(duration_s),
+        "duration_s": float(duration_s),
+        "hold_duration": float(hold_s),
+        "hold_duration_s": float(hold_s),
+
+        "sr": int(snap.sr),
+        "sample_rate": int(snap.sr),
+
+        "velocity": velocity,
+        "vel": velocity,
+
+        "track_index": int(track_i),
+        "track_name": str(track_name),
+        "note_index": int(note_i),
+        "instrument_index": int(inst_i),
+
+        "start_step": int(ev.start_step),
+        "length_steps": int(ev.length_steps),
+        "step_seconds": float(step_s),
+        "step_samples": int(step_n),
+        "start_sample": int(start_sample_abs),
+
+        # Stable per-note seed. Sound blocks can use this for consistent pick,
+        # breath, hammer, phase, noise, and stereo micro variation.
+        "seed": int(render_seed),
+        "phase_seed": int(render_seed),
+    }
 
 
 def _render_python_instrument_track(
@@ -681,95 +1036,153 @@ def _render_python_instrument_track(
     track: Track,
     notes: Tuple[NoteEvent, ...],
     *,
+    track_i: int,
     start_sample: int,
     window_n: int,
     step_s: float,
     step_n: int,
     total_n: int,
+    preview: bool,
 ) -> np.ndarray:
     instruments = list(track.instruments) or [BlockInstance("synth_keys", {})]
-    inst_gens: List[Tuple[BaseBlock, Dict[str, Any]]] = []
+    inst_gens: List[Tuple[BaseBlock, Dict[str, Any], str]] = []
 
-    for inst in instruments:
+    for inst_i, inst in enumerate(instruments):
+        name = str(inst.name).strip().lower()
+
         try:
-            inst_gens.append((BLOCKS.create(inst.name), dict(inst.params or {})))
+            blk = BLOCKS.create(name)
+            kind = _block_kind_safe(name)
+            p = _normalize_block_params(
+                name,
+                dict(inst.params or {}),
+                sr=int(snap.sr),
+                preview=bool(preview),
+                track_index=int(track_i),
+                track_name=str(track.name),
+                block_index=int(inst_i),
+                block_kind=kind,
+                render_seed=1009 + track_i * 131 + inst_i * 17,
+                start_sample=int(start_sample),
+            )
+            inst_gens.append((blk, p, name))
         except Exception as exc:
-            print(f"[pipeline] missing instrument '{inst.name}': {exc}")
+            print(f"[pipeline] missing instrument '{name}': {exc}")
 
     if not inst_gens:
         return np.zeros((window_n, 2), dtype=np.float32)
 
     tbuf = np.zeros((window_n, 2), dtype=np.float32)
+    fade_n = max(8, int(round(0.0015 * int(snap.sr))))
 
-    for ev in notes:
+    for note_i, ev in enumerate(notes):
         dur_steps = max(1, int(ev.length_steps))
-        dur_s = dur_steps * step_s
-        dur_n = max(1, int(round(dur_s * int(snap.sr))))
-
-        note_a = int(ev.start_step) * step_n
-        note_b = note_a + dur_n
-
-        if note_b <= start_sample or note_a >= start_sample + window_n:
-            continue
+        hold_s = dur_steps * step_s
+        note_start_abs = int(ev.start_step) * step_n
 
         note, octv = ev.pitch
 
         try:
+            midi = midi_from_note(note, octv)
             freq = hz_from_note(note, octv)
         except Exception:
             continue
 
-        velocity = float(np.clip(ev.velocity, 0.0, 2.0))
+        # Compute the longest layer length for this note.
+        voice_specs: List[Tuple[BaseBlock, Dict[str, Any], str, int, float]] = []
+        max_voice_n = 0
 
-        payload = {
-            "freq": float(freq),
-            "duration": float(dur_s),
-            "sr": int(snap.sr),
-            "velocity": velocity,
-            "vel": velocity,
-            "note": str(note),
-            "octave": int(octv),
-            "start_step": int(ev.start_step),
-            "length_steps": int(ev.length_steps),
-        }
+        for inst_i, (gen, p, name) in enumerate(inst_gens):
+            tail_s = _instrument_tail_seconds(p)
+            voice_s = float(max(0.001, hold_s + tail_s))
+            voice_n = max(1, int(round(voice_s * int(snap.sr))))
+            max_voice_n = max(max_voice_n, voice_n)
+            voice_specs.append((gen, p, name, inst_i, voice_s))
 
-        layer = np.zeros((dur_n, 2), dtype=np.float32)
-
-        for gen, p in inst_gens:
-            try:
-                # IMPORTANT:
-                # Always execute the actual block. Do not bypass synth_keys with
-                # native render_synth_notes here, because the GUI wave controls are
-                # block params like wave/wave_alt/wave_blend/pwm/fm/etc.
-                raw, _ = gen.execute(payload, params={**p, "sr": int(snap.sr)})
-                y = _as_audio_buffer(raw, int(snap.sr)).data
-            except Exception as exc:
-                print(f"[pipeline] block '{gen.__class__.__name__}' failed: {exc}")
-                continue
-
-            if y.shape[0] < dur_n:
-                padded = np.zeros((dur_n, 2), dtype=np.float32)
-                padded[: y.shape[0]] = y
-                y = padded
-            elif y.shape[0] > dur_n:
-                y = y[:dur_n]
-
-            layer = _mix_into(layer, y, 1.0)
-
-        a = max(note_a, start_sample)
-        b = min(note_b, start_sample + window_n, total_n)
-
-        if b <= a:
+        if max_voice_n <= 0:
             continue
 
-        da = a - start_sample
-        db = b - start_sample
-        sa = a - note_a
-        sb = sa + (db - da)
+        note_end_abs = note_start_abs + max_voice_n
 
-        tbuf[da:db] += layer[sa:sb]
+        if note_end_abs <= start_sample or note_start_abs >= start_sample + window_n:
+            continue
 
-    return sanitize_audio(tbuf)
+        layer = np.zeros((max_voice_n, 2), dtype=np.float32)
+
+        for gen, p, name, inst_i, voice_s in voice_specs:
+            render_seed = int(
+                1000003
+                + snap.version * 101
+                + track_i * 1009
+                + note_i * 9176
+                + inst_i * 431
+                + int(ev.start_step) * 13
+                + midi * 7
+            )
+
+            pp = dict(p)
+            pp["seed"] = int(pp.get("seed", render_seed))
+            pp["render_seed"] = render_seed
+            pp["note_seed"] = render_seed
+            pp["note_index"] = int(note_i)
+            pp["instrument_index"] = int(inst_i)
+
+            payload = _make_note_payload(
+                snap,
+                ev,
+                track_i=track_i,
+                track_name=track.name,
+                note_i=note_i,
+                inst_i=inst_i,
+                freq=freq,
+                midi=midi,
+                duration_s=voice_s,
+                hold_s=hold_s,
+                start_sample_abs=note_start_abs,
+                step_s=step_s,
+                step_n=step_n,
+                render_seed=render_seed,
+            )
+
+            try:
+                raw, _meta = gen.execute(payload, params=pp)
+                y = _as_audio_buffer(raw, int(snap.sr)).data
+            except Exception as exc:
+                print(f"[pipeline] instrument '{name}' failed: {exc}")
+                continue
+
+            y = ensure_stereo(y).astype(np.float32, copy=False)
+            y = _fade_edges(y, fade_n)
+
+            if y.shape[0] < max_voice_n:
+                padded = np.zeros((max_voice_n, 2), dtype=np.float32)
+                padded[:y.shape[0]] = y
+                y = padded
+            elif y.shape[0] > max_voice_n:
+                y = y[:max_voice_n]
+
+            # Layer headroom. More instruments should sound layered, not clipped.
+            layer_gain = 1.0 / math.sqrt(max(1, len(inst_gens)))
+            layer = _mix_into(layer, y, layer_gain)
+
+        # Put rendered note layer into the requested render window.
+        a_abs = max(note_start_abs, start_sample)
+        b_abs = min(note_end_abs, start_sample + window_n, total_n)
+
+        if b_abs <= a_abs:
+            continue
+
+        dst_a = a_abs - start_sample
+        dst_b = b_abs - start_sample
+        src_a = a_abs - note_start_abs
+        src_b = src_a + (dst_b - dst_a)
+
+        tbuf[dst_a:dst_b] += layer[src_a:src_b]
+
+    # Per-track safety before FX.
+    tbuf = _dc_block_stereo(tbuf)
+    tbuf = sanitize_audio(tbuf, ceiling=1.25)
+    return tbuf.astype(np.float32, copy=False)
 
 
 def _render_dry_track(
@@ -781,33 +1194,94 @@ def _render_dry_track(
     step_s: float,
     step_n: int,
     total_n: int,
+    render_tail_n: int,
+    preview: bool,
 ) -> np.ndarray:
     track = snap.tracks[track_i]
     notes = snap.notes[track_i] if track_i < len(snap.notes) else ()
 
-    key = _track_key(snap, track_i, start_sample, window_n, step_n)
+    key = _track_key(snap, track_i, start_sample, window_n, step_n, render_tail_n)
     cached = _cache_get(key)
 
     if cached is not None:
         return cached
 
-    # IMPORTANT:
-    # This deliberately uses the Python block path for every instrument.
-    # This fixes wave params because each sound block receives the exact params
-    # that the GUI changed.
     out = _render_python_instrument_track(
         snap,
         track,
         notes,
+        track_i=track_i,
         start_sample=start_sample,
         window_n=window_n,
         step_s=step_s,
         step_n=step_n,
         total_n=total_n,
+        preview=preview,
     )
 
     _cache_put(key, out)
     return out
+
+
+def _apply_fx_chain(
+    tbuf: np.ndarray,
+    snap: SequenceSnapshot,
+    track: Track,
+    *,
+    track_i: int,
+    start_sample: int,
+    preview: bool,
+    common: Dict[str, Any],
+) -> np.ndarray:
+    fx_chain: List[Tuple[BaseBlock, Dict[str, Any]]] = []
+
+    for fx_i, bi in enumerate(track.fx):
+        name = str(bi.name).strip().lower()
+
+        try:
+            blk = BLOCKS.create(name)
+            kind = _block_kind_safe(name)
+            p = _normalize_block_params(
+                name,
+                dict(bi.params or {}),
+                sr=int(snap.sr),
+                preview=bool(preview),
+                track_index=int(track_i),
+                track_name=str(track.name),
+                block_index=int(fx_i),
+                block_kind=kind,
+                render_seed=9001 + track_i * 353 + fx_i * 29,
+                start_sample=int(start_sample),
+            )
+            fx_chain.append((blk, p))
+        except Exception as exc:
+            print(f"[pipeline] missing fx '{name}': {exc}")
+
+    if not fx_chain:
+        return tbuf
+
+    try:
+        fx_out, _ = run_chain(
+            AudioBuffer(tbuf, int(snap.sr)),
+            fx_chain,
+            common={
+                **common,
+                "sr": int(snap.sr),
+                "sample_rate": int(snap.sr),
+                "preview": bool(preview),
+                "track_index": int(track_i),
+                "track_name": str(track.name),
+                "window_start_sample": int(start_sample),
+            },
+        )
+        y = _as_audio_buffer(fx_out, int(snap.sr)).data
+    except Exception as exc:
+        print(f"[pipeline] fx chain failed: {exc}")
+        y = tbuf
+
+    y = _dc_block_stereo(y)
+    y = sanitize_audio(y, ceiling=1.25)
+    return y.astype(np.float32, copy=False)
 
 
 def _render_snapshot(
@@ -818,28 +1292,68 @@ def _render_snapshot(
     common: Dict[str, Any] | None = None,
 ) -> AudioBuffer:
     common = dict(common or {})
-    total_n = max(0, int(snap.steps_per_bar) * int(snap.bars) * max(1, int(round(((4.0 * (60.0 / max(1e-6, snap.bpm))) / max(1, snap.steps_per_bar)) * snap.sr))))
+
+    sr = int(snap.sr)
+    step_s = (4.0 * (60.0 / max(1.0e-6, float(snap.bpm)))) / float(max(1, int(snap.steps_per_bar)))
+    step_n = max(1, int(round(step_s * sr)))
+    base_total_n = int(snap.steps_per_bar) * int(snap.bars) * step_n
+
+    # Export/full render should preserve instrument release and FX tails.
+    # Preview windows still stay capped by max_samples for responsiveness.
+    tail_s = float(common.get("render_tail_seconds", 0.75))
+
+    for track in snap.tracks:
+        for inst in track.instruments:
+            p = _normalize_block_params(
+                inst.name,
+                dict(inst.params or {}),
+                sr=sr,
+                preview=max_samples is not None,
+                track_index=0,
+                track_name=track.name,
+                block_index=0,
+                block_kind="instrument",
+                render_seed=0,
+                start_sample=int(start_sample),
+            )
+            tail_s = max(tail_s, _instrument_tail_seconds(p))
+
+        tail_s = max(tail_s, _track_fx_tail_seconds(track))
+
+    if max_samples is not None:
+        # Keep live preview fast, but still leave a little space for release.
+        tail_s = min(tail_s, float(common.get("preview_tail_seconds", 0.75)))
+
+    render_tail_n = int(round(max(0.0, tail_s) * sr))
+    total_n = max(0, base_total_n + render_tail_n)
 
     start_sample = int(max(0, start_sample))
+
     if max_samples is None:
         window_n = max(0, total_n - start_sample)
     else:
         window_n = max(0, min(int(max_samples), total_n - start_sample))
 
     if window_n <= 0:
-        return AudioBuffer.silence(0, int(snap.sr))
+        return AudioBuffer.silence(0, sr)
 
-    step_s = (4.0 * (60.0 / max(1e-6, float(snap.bpm)))) / float(max(1, int(snap.steps_per_bar)))
-    step_n = max(1, int(round(step_s * int(snap.sr))))
-
+    preview = max_samples is not None
     any_solo = any(bool(t.solo) for t in snap.tracks)
     out = np.zeros((window_n, 2), dtype=np.float32)
 
-    for ti, track in enumerate(snap.tracks):
-        if bool(track.mute):
-            continue
-        if any_solo and not bool(track.solo):
-            continue
+    active_tracks = [
+        i for i, t in enumerate(snap.tracks)
+        if not bool(t.mute) and (not any_solo or bool(t.solo))
+    ]
+
+    if not active_tracks:
+        return AudioBuffer.silence(window_n, sr)
+
+    # Track summing headroom. Keeps layers loud enough without instant clipping.
+    active_gain = 1.0 / math.sqrt(max(1, len(active_tracks)))
+
+    for ti in active_tracks:
+        track = snap.tracks[ti]
 
         dry = _render_dry_track(
             snap,
@@ -849,35 +1363,29 @@ def _render_snapshot(
             step_s=step_s,
             step_n=step_n,
             total_n=total_n,
+            render_tail_n=render_tail_n,
+            preview=preview,
         )
 
-        tbuf = dry
+        tbuf = _apply_fx_chain(
+            dry,
+            snap,
+            track,
+            track_i=ti,
+            start_sample=start_sample,
+            preview=preview,
+            common=common,
+        )
 
-        fx_chain: List[Tuple[BaseBlock, Dict[str, Any]]] = []
-        for bi in track.fx:
-            try:
-                fx_chain.append((BLOCKS.create(bi.name), dict(bi.params or {})))
-            except Exception as exc:
-                print(f"[pipeline] missing fx '{bi.name}': {exc}")
+        track_volume = float(track.volume)
+        if "track_gain_db" in common:
+            track_volume *= _db_to_gain(float(common["track_gain_db"]))
 
-        if fx_chain:
-            try:
-                fx_out, _ = run_chain(
-                    AudioBuffer(tbuf, int(snap.sr)),
-                    fx_chain,
-                    common={
-                        **common,
-                        "sr": int(snap.sr),
-                        "preview": max_samples is not None,
-                    },
-                )
-                tbuf = _as_audio_buffer(fx_out, int(snap.sr)).data
-            except Exception as exc:
-                print(f"[pipeline] fx chain failed: {exc}")
+        out = _mix_into(out, tbuf, track_volume * active_gain)
 
-        out = _mix_into(out, tbuf, float(track.volume))
+    out = _master_finish(out, sr, common=common)
 
-    return AudioBuffer(sanitize_audio(out), int(snap.sr))
+    return AudioBuffer(out.astype(np.float32, copy=False), sr)
 
 
 # ============================================================================
@@ -897,6 +1405,7 @@ class MemoryBallast:
         with self._lock:
             self._chunks.clear()
             remaining = mb
+
             while remaining > 0:
                 take = min(chunk_mb, remaining)
                 self._chunks.append(bytearray(take * 1024 * 1024))
@@ -923,6 +1432,7 @@ class CpuBallast:
 
     def set_target_pct(self, pct: int) -> None:
         pct = int(max(0, min(80, pct)))
+
         with self._lock:
             self._target_pct = pct
 
@@ -937,6 +1447,7 @@ class CpuBallast:
 
     def _loop(self) -> None:
         period = 0.05
+
         while not self._stop.is_set():
             with self._lock:
                 pct = int(self._target_pct)
@@ -957,3 +1468,49 @@ class CpuBallast:
     def stop(self) -> None:
         self._stop.set()
 
+
+def build_demo_project() -> Sequence:
+    seq = Sequence(sr=48000, bpm=120.0, steps_per_bar=16, bars=2)
+    seq.tracks = [
+        Track(
+            name="Track 1",
+            instruments=[
+                BlockInstance(
+                    "synth_keys",
+                    {
+                        "wave": "saw",
+                        "amp": 0.22,
+                        "attack": 0.006,
+                        "release": 0.18,
+                        "unison": 3,
+                        "detune_cents": 7.0,
+                        "chorus_mix": 0.12,
+                    },
+                )
+            ],
+            fx=[
+                BlockInstance("sound_polish", {"drive": 0.45, "warmth": 0.20}),
+            ],
+        ),
+    ]
+    seq.ensure()
+
+    notes = [
+        ("C", 4, 0),
+        ("E", 4, 4),
+        ("G", 4, 8),
+        ("C", 5, 12),
+        ("G", 4, 16),
+        ("E", 4, 20),
+        ("D", 4, 24),
+        ("C", 4, 28),
+    ]
+
+    for note, octv, step in notes:
+        seq.add_note(0, step, (note, octv), length_steps=3, velocity=1.0)
+
+    return seq
+
+
+class AnimationRenderer:
+    pass
