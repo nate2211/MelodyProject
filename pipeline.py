@@ -14,21 +14,26 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from melodyproject_native import (
-    NATIVE_DSP,
-    ensure_stereo,
-    native_status,
-    waveform_id,
-)
-
 try:
-    import psutil
+    from melodyproject_native import NATIVE_DSP, ensure_stereo
 except Exception:
-    psutil = None  # type: ignore
+    NATIVE_DSP = None  # type: ignore
+
+    def ensure_stereo(x: Any) -> np.ndarray:
+        a = np.asarray(x, dtype=np.float32)
+        if a.ndim == 0:
+            a = np.zeros((0, 2), dtype=np.float32)
+        if a.ndim == 1:
+            a = a[:, None]
+        if a.shape[1] == 1:
+            a = np.repeat(a, 2, axis=1)
+        elif a.shape[1] > 2:
+            a = a[:, :2]
+        return np.asarray(a, dtype=np.float32)
 
 
 # ============================================================================
-# Audio buffer + IO helpers
+# Audio helpers
 # ============================================================================
 
 @dataclass
@@ -49,28 +54,32 @@ class AudioBuffer:
 
 
 def sanitize_audio(x: Any, *, ceiling: float = 0.995) -> np.ndarray:
-    return NATIVE_DSP.sanitize(ensure_stereo(x), ceiling=float(ceiling))
+    y = ensure_stereo(x).astype(np.float32, copy=False)
+    y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+    ceiling = float(max(0.05, ceiling))
+    return np.clip(y, -ceiling, ceiling).astype(np.float32, copy=False)
 
 
 def normalize_for_playback(buf: AudioBuffer, *, peak: float = 0.98, only_if_over: bool = True) -> AudioBuffer:
-    x = NATIVE_DSP.soft_clip_normalize(
-        buf.data,
-        ceiling=0.995,
-        peak=float(peak),
-        only_if_over=bool(only_if_over),
-    )
-    return AudioBuffer(x, int(buf.sr))
+    x = sanitize_audio(buf.data, ceiling=1.25)
+    mx = float(np.max(np.abs(x))) if x.size else 0.0
+    peak = float(max(0.05, peak))
+
+    if mx > 1e-9 and ((not only_if_over) or mx > peak):
+        x = x * (peak / mx)
+
+    return AudioBuffer(sanitize_audio(x, ceiling=0.995), int(buf.sr))
 
 
 def write_wav(path: str | os.PathLike[str], buf: AudioBuffer) -> None:
-    x = normalize_for_playback(buf, peak=0.98, only_if_over=True).data
-    pcm = np.clip(x, -1.0, 1.0)
+    b = normalize_for_playback(buf, peak=0.98, only_if_over=True)
+    pcm = np.clip(b.data, -1.0, 1.0)
     pcm = (pcm * 32767.0).astype(np.int16)
 
     with wave.open(str(path), "wb") as wf:
         wf.setnchannels(2)
         wf.setsampwidth(2)
-        wf.setframerate(int(buf.sr))
+        wf.setframerate(int(b.sr))
         wf.writeframes(pcm.tobytes())
 
 
@@ -78,10 +87,8 @@ def _pcm_to_float(raw: bytes, channels: int, sampwidth: int) -> np.ndarray:
     if sampwidth == 1:
         a = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
         a = (a - 128.0) / 128.0
-
     elif sampwidth == 2:
         a = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
-
     elif sampwidth == 3:
         b = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
         a32 = (
@@ -92,10 +99,8 @@ def _pcm_to_float(raw: bytes, channels: int, sampwidth: int) -> np.ndarray:
         sign = a32 & 0x800000
         a32 = a32 - (sign << 1)
         a = a32.astype(np.float32) / 8388608.0
-
     elif sampwidth == 4:
         a = np.frombuffer(raw, dtype="<i4").astype(np.float32) / 2147483648.0
-
     else:
         raise ValueError(f"Unsupported WAV sample width: {sampwidth}")
 
@@ -149,7 +154,7 @@ def read_wav(path: str | os.PathLike[str], *, target_sr: Optional[int] = None) -
 
 
 # ============================================================================
-# Blocks framework
+# Block framework
 # ============================================================================
 
 class BaseBlock:
@@ -167,10 +172,8 @@ class Registry:
 
     def register(self, name: str, cls: type[BaseBlock]) -> None:
         key = str(name).strip().lower()
-
         if not key:
             raise ValueError("Block name cannot be empty")
-
         with self._lock:
             self._by_name[key] = cls
 
@@ -224,7 +227,6 @@ def register_block(*names: str):
 def _as_audio_buffer(x: Any, sr: int) -> AudioBuffer:
     if isinstance(x, AudioBuffer):
         return AudioBuffer(sanitize_audio(x.data), int(x.sr))
-
     return AudioBuffer(sanitize_audio(x), int(sr))
 
 
@@ -271,224 +273,14 @@ NOTE_TO_SEMI = {
 
 def midi_from_note(note: str, octave: int) -> int:
     key = str(note).strip().upper().replace("♯", "#").replace("♭", "B")
-
     if key not in NOTE_TO_SEMI:
         raise KeyError(f"Unknown note name: {note}")
-
     return int((int(octave) + 1) * 12 + NOTE_TO_SEMI[key])
 
 
 def hz_from_note(note: str, octave: int) -> float:
     midi = midi_from_note(note, octave)
     return 440.0 * (2.0 ** ((midi - 69) / 12.0))
-
-
-# ============================================================================
-# Native-backed built-in blocks
-# ============================================================================
-
-@register_block("synth_keys", "synth", "native_synth")
-class SynthKeysBlock(BaseBlock):
-    KIND = "instrument"
-    PARAMS = {
-        "waveform": {"type": "choice", "default": "sine", "choices": ["sine", "square", "saw", "triangle"]},
-        "gain": {"type": "float", "default": 0.22, "min": 0.0, "max": 2.0},
-        "attack": {"type": "float", "default": 0.004, "min": 0.0, "max": 2.0},
-        "release": {"type": "float", "default": 0.035, "min": 0.0, "max": 5.0},
-        "pan": {"type": "float", "default": 0.0, "min": -1.0, "max": 1.0},
-    }
-
-    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
-        if not isinstance(payload, dict):
-            return AudioBuffer.silence(0, int(params.get("sr", 48000))), {}
-
-        sr = int(payload.get("sr", params.get("sr", 48000)))
-        duration = float(payload.get("duration", params.get("duration", 0.25)))
-        frames = max(1, int(round(duration * sr)))
-
-        freq = float(payload.get("freq", 440.0))
-        midi = int(round(69.0 + 12.0 * math.log2(max(1.0e-9, freq) / 440.0)))
-        velocity = float(payload.get("velocity", 1.0))
-
-        y = NATIVE_DSP.render_synth_notes(
-            np.asarray([midi], dtype=np.int32),
-            np.asarray([0], dtype=np.int32),
-            np.asarray([frames], dtype=np.int32),
-            np.asarray([velocity], dtype=np.float32),
-            total_frames=frames,
-            sample_rate=sr,
-            waveform=waveform_id(params.get("waveform", "sine")),
-            master_gain=float(params.get("gain", params.get("master_gain", 0.22))),
-            attack_seconds=float(params.get("attack", params.get("attack_seconds", 0.004))),
-            release_seconds=float(params.get("release", params.get("release_seconds", 0.035))),
-            pan=float(params.get("pan", 0.0)),
-        )
-
-        return AudioBuffer(y, sr), {"native": NATIVE_DSP.available}
-
-
-@register_block("gain", "volume")
-class GainBlock(BaseBlock):
-    KIND = "fx"
-    PARAMS = {
-        "gain": {"type": "float", "default": 1.0, "min": 0.0, "max": 4.0},
-    }
-
-    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
-        buf = _as_audio_buffer(payload, int(params.get("sr", 48000)))
-        y = NATIVE_DSP.gain(buf.data, float(params.get("gain", 1.0)))
-        return AudioBuffer(y, buf.sr), {"native": NATIVE_DSP.available}
-
-
-@register_block("lowpass", "filter_lowpass")
-class LowpassBlock(BaseBlock):
-    KIND = "fx"
-    PARAMS = {
-        "cutoff_hz": {"type": "float", "default": 6000.0, "min": 10.0, "max": 22000.0},
-        "wet": {"type": "float", "default": 1.0, "min": 0.0, "max": 1.0},
-    }
-
-    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
-        buf = _as_audio_buffer(payload, int(params.get("sr", 48000)))
-        y = NATIVE_DSP.lowpass(
-            buf.data,
-            sample_rate=buf.sr,
-            cutoff_hz=float(params.get("cutoff_hz", params.get("cutoff", 6000.0))),
-            wet=float(params.get("wet", 1.0)),
-        )
-        return AudioBuffer(y, buf.sr), {"native": NATIVE_DSP.available}
-
-
-@register_block("delay")
-class DelayBlock(BaseBlock):
-    KIND = "fx"
-    PARAMS = {
-        "delay_ms": {"type": "float", "default": 250.0, "min": 1.0, "max": 5000.0},
-        "feedback": {"type": "float", "default": 0.25, "min": 0.0, "max": 0.98},
-        "wet": {"type": "float", "default": 0.35, "min": 0.0, "max": 2.0},
-    }
-
-    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
-        buf = _as_audio_buffer(payload, int(params.get("sr", 48000)))
-        y = NATIVE_DSP.delay(
-            buf.data,
-            sample_rate=buf.sr,
-            delay_ms=float(params.get("delay_ms", 250.0)),
-            feedback=float(params.get("feedback", 0.25)),
-            wet=float(params.get("wet", 0.35)),
-        )
-        return AudioBuffer(y, buf.sr), {"native": NATIVE_DSP.available}
-
-
-@register_block("stereo_width", "width")
-class StereoWidthBlock(BaseBlock):
-    KIND = "fx"
-    PARAMS = {
-        "width": {"type": "float", "default": 1.2, "min": 0.0, "max": 3.0},
-    }
-
-    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
-        buf = _as_audio_buffer(payload, int(params.get("sr", 48000)))
-        y = NATIVE_DSP.stereo_width(buf.data, width=float(params.get("width", 1.2)))
-        return AudioBuffer(y, buf.sr), {"native": NATIVE_DSP.available}
-
-
-@register_block("normalize", "limiter", "clip")
-class ClipNormalizeBlock(BaseBlock):
-    KIND = "fx"
-    PARAMS = {
-        "ceiling": {"type": "float", "default": 0.995, "min": 0.05, "max": 1.0},
-        "peak": {"type": "float", "default": 0.98, "min": 0.05, "max": 1.0},
-        "only_if_over": {"type": "bool", "default": True},
-    }
-
-    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
-        buf = _as_audio_buffer(payload, int(params.get("sr", 48000)))
-        y = NATIVE_DSP.soft_clip_normalize(
-            buf.data,
-            ceiling=float(params.get("ceiling", 0.995)),
-            peak=float(params.get("peak", 0.98)),
-            only_if_over=bool(params.get("only_if_over", True)),
-        )
-        return AudioBuffer(y, buf.sr), {"native": NATIVE_DSP.available}
-
-
-@register_block("tonal_imprint", "convolution")
-class TonalImprintBlock(BaseBlock):
-    KIND = "fx"
-    PARAMS = {
-        "ir_path": {"type": "str", "default": ""},
-        "dry": {"type": "float", "default": 0.7, "min": 0.0, "max": 2.0},
-        "wet": {"type": "float", "default": 0.3, "min": 0.0, "max": 2.0},
-        "normalize_ir": {"type": "bool", "default": True},
-        "preview_max_ir_frames": {"type": "int", "default": 4096, "min": 64, "max": 96000},
-        "full_max_ir_frames": {"type": "int", "default": 24000, "min": 64, "max": 192000},
-    }
-
-    _cache_lock = threading.RLock()
-    _ir_cache: Dict[Tuple[str, int, int], np.ndarray] = {}
-
-    def _default_ir(self, sr: int, max_frames: int) -> np.ndarray:
-        frames = max(32, min(int(max_frames), int(sr * 0.035)))
-        ir = np.zeros((frames, 2), dtype=np.float32)
-        ir[0, :] = 1.0
-
-        for i in range(1, frames):
-            t = i / float(sr)
-            decay = math.exp(-t * 45.0)
-            ir[i, 0] = math.sin(i * 0.037) * decay * 0.18
-            ir[i, 1] = math.sin(i * 0.041) * decay * 0.18
-
-        return ir
-
-    def _load_ir(self, path: str, sr: int, max_frames: int) -> np.ndarray:
-        path = str(path or "").strip()
-
-        if not path:
-            return self._default_ir(sr, max_frames)
-
-        p = Path(path).expanduser()
-
-        if not p.exists():
-            return self._default_ir(sr, max_frames)
-
-        key = (str(p.resolve()), int(sr), int(max_frames))
-
-        with self._cache_lock:
-            hit = self._ir_cache.get(key)
-            if hit is not None:
-                return hit.copy()
-
-        ir = read_wav(p, target_sr=sr).data
-        ir = ensure_stereo(ir)[:max_frames]
-
-        with self._cache_lock:
-            self._ir_cache[key] = ir.copy()
-
-        return ir
-
-    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
-        buf = _as_audio_buffer(payload, int(params.get("sr", 48000)))
-        preview = bool(params.get("preview", False))
-
-        max_ir = int(
-            params.get(
-                "preview_max_ir_frames" if preview else "full_max_ir_frames",
-                4096 if preview else 24000,
-            )
-        )
-
-        ir = self._load_ir(str(params.get("ir_path", "")), buf.sr, max_ir)
-
-        y = NATIVE_DSP.convolve(
-            buf.data,
-            ir,
-            dry=float(params.get("dry", 0.7)),
-            wet=float(params.get("wet", 0.3)),
-            normalize_ir=bool(params.get("normalize_ir", True)),
-        )
-
-        return AudioBuffer(y, buf.sr), {"native": NATIVE_DSP.available, "ir_frames": int(ir.shape[0])}
 
 
 # ============================================================================
@@ -555,7 +347,7 @@ class SequenceSnapshot:
 # Render cache
 # ============================================================================
 
-_RENDER_CACHE_MAX_ITEMS = int(os.getenv("MELODY_RENDER_CACHE_ITEMS", "48"))
+_RENDER_CACHE_MAX_ITEMS = int(os.getenv("MELODY_RENDER_CACHE_ITEMS", "64"))
 _RENDER_CACHE_LOCK = threading.RLock()
 _RENDER_CACHE: "OrderedDict[str, np.ndarray]" = OrderedDict()
 
@@ -569,6 +361,9 @@ def _stable_data(obj: Any) -> Any:
 
     if isinstance(obj, (list, tuple)):
         return [_stable_data(v) for v in obj]
+
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
 
     if isinstance(obj, (np.integer,)):
         return int(obj)
@@ -595,10 +390,8 @@ def clear_render_cache() -> None:
 def _cache_get(key: str) -> Optional[np.ndarray]:
     with _RENDER_CACHE_LOCK:
         x = _RENDER_CACHE.get(key)
-
         if x is None:
             return None
-
         _RENDER_CACHE.move_to_end(key)
         return x.copy()
 
@@ -612,7 +405,7 @@ def _cache_put(key: str, value: np.ndarray) -> None:
             _RENDER_CACHE.popitem(last=False)
 
 
-def _dry_track_key(
+def _track_key(
     snap: SequenceSnapshot,
     track_i: int,
     start_sample: int,
@@ -624,7 +417,8 @@ def _dry_track_key(
 
     return _cache_hash(
         {
-            "type": "native_dry_track_v3",
+            "type": "python_block_track_v5_wave_params",
+            "version": int(snap.version),
             "track_i": int(track_i),
             "sr": int(snap.sr),
             "bpm": float(snap.bpm),
@@ -633,7 +427,7 @@ def _dry_track_key(
             "start_sample": int(start_sample),
             "window_n": int(window_n),
             "step_n": int(step_n),
-            "instruments": track.instruments,
+            "track": track,
             "notes": notes,
         }
     )
@@ -658,6 +452,7 @@ class Sequence:
     def touch(self) -> None:
         with self._lock:
             self._version += 1
+        clear_render_cache()
 
     @property
     def version(self) -> int:
@@ -684,7 +479,6 @@ class Sequence:
         with self._lock:
             while len(self.notes) < len(self.tracks):
                 self.notes.append([])
-
             while len(self.notes) > len(self.tracks):
                 self.notes.pop()
 
@@ -733,7 +527,6 @@ class Sequence:
 
             end = start_step + length_steps
             pitch = (str(pitch[0]), int(pitch[1]))
-
             new_list: List[NoteEvent] = []
 
             for ev in self.notes[track_i]:
@@ -758,6 +551,7 @@ class Sequence:
             new_list.sort(key=lambda e: (int(e.start_step), int(e.pitch[1]), str(e.pitch[0])))
             self.notes[track_i] = new_list
             self._version += 1
+            clear_render_cache()
 
             for i, ev in enumerate(self.notes[track_i]):
                 if ev.start_step == start_step and ev.pitch == pitch and ev.length_steps == length_steps:
@@ -814,6 +608,7 @@ class Sequence:
             if 0 <= int(track_i) < len(self.notes) and 0 <= int(note_index) < len(self.notes[int(track_i)]):
                 self.notes[int(track_i)].pop(int(note_index))
                 self._version += 1
+                clear_render_cache()
 
     def set_note_length(self, track_i: int, note_index: int, length_steps: int) -> None:
         self.ensure()
@@ -821,13 +616,13 @@ class Sequence:
         with self._lock:
             if not (0 <= int(track_i) < len(self.notes)):
                 return
-
             if not (0 <= int(note_index) < len(self.notes[int(track_i)])):
                 return
 
             ev = self.notes[int(track_i)][int(note_index)]
             ev.length_steps = self._clamp_len(int(ev.start_step), int(length_steps))
             self._version += 1
+            clear_render_cache()
 
     def set_note_velocity(self, track_i: int, note_index: int, velocity: float) -> None:
         self.ensure()
@@ -836,10 +631,10 @@ class Sequence:
             if 0 <= int(track_i) < len(self.notes) and 0 <= int(note_index) < len(self.notes[int(track_i)]):
                 self.notes[int(track_i)][int(note_index)].velocity = float(np.clip(velocity, 0.0, 2.0))
                 self._version += 1
+                clear_render_cache()
 
     def toggle_note_at(self, track_i: int, start_step: int, pitch: Tuple[str, int]) -> None:
         idx = self.find_note_starting_at(track_i, start_step, pitch)
-
         if idx is not None:
             self.remove_note(track_i, idx)
         else:
@@ -867,88 +662,18 @@ class Sequence:
 
 
 # ============================================================================
-# Native render path
+# Render engine
 # ============================================================================
 
-_NATIVE_SYNTH_NAMES = {"synth_keys", "synth", "native_synth"}
+def _mix_into(dst: np.ndarray, src: np.ndarray, gain: float = 1.0) -> np.ndarray:
+    if dst.size == 0:
+        return dst
 
-
-def _render_native_synth_track(
-    snap: SequenceSnapshot,
-    track: Track,
-    notes: Tuple[NoteEvent, ...],
-    *,
-    start_sample: int,
-    window_n: int,
-    step_s: float,
-    step_n: int,
-    total_n: int,
-) -> np.ndarray:
-    if not notes:
-        return np.zeros((window_n, 2), dtype=np.float32)
-
-    instruments = list(track.instruments) or [BlockInstance("synth_keys", {})]
-    tbuf = np.zeros((window_n, 2), dtype=np.float32)
-
-    midi_values: List[int] = []
-    starts: List[int] = []
-    lengths: List[int] = []
-    velocities: List[float] = []
-
-    for ev in notes:
-        try:
-            midi = midi_from_note(ev.pitch[0], ev.pitch[1])
-        except Exception:
-            continue
-
-        dur_steps = max(1, int(ev.length_steps))
-        dur_s = dur_steps * step_s
-        dur_n = max(1, int(round(dur_s * int(snap.sr))))
-
-        note_a = int(ev.start_step) * step_n
-        note_b = note_a + dur_n
-
-        if note_b <= start_sample or note_a >= start_sample + window_n:
-            continue
-
-        midi_values.append(int(midi))
-        starts.append(int(note_a - start_sample))
-        lengths.append(int(dur_n))
-        velocities.append(float(np.clip(ev.velocity, 0.0, 2.0)))
-
-    if not midi_values:
-        return tbuf
-
-    midi_arr = np.asarray(midi_values, dtype=np.int32)
-    start_arr = np.asarray(starts, dtype=np.int32)
-    length_arr = np.asarray(lengths, dtype=np.int32)
-    velocity_arr = np.asarray(velocities, dtype=np.float32)
-
-    for inst in instruments:
-        name = str(inst.name).strip().lower()
-
-        if name not in _NATIVE_SYNTH_NAMES:
-            continue
-
-        p = dict(inst.params or {})
-
-        layer = NATIVE_DSP.render_synth_notes(
-            midi_arr,
-            start_arr,
-            length_arr,
-            velocity_arr,
-            total_frames=window_n,
-            sample_rate=int(snap.sr),
-            waveform=waveform_id(p.get("waveform", "sine")),
-            master_gain=float(p.get("gain", p.get("master_gain", 0.22))),
-            attack_seconds=float(p.get("attack", p.get("attack_seconds", 0.004))),
-            release_seconds=float(p.get("release", p.get("release_seconds", 0.035))),
-            pan=float(p.get("pan", 0.0)),
-        )
-
-        tbuf = NATIVE_DSP.mix_into(tbuf, layer, 1.0)
-
-    return sanitize_audio(tbuf)
+    src = ensure_stereo(src)
+    n = min(dst.shape[0], src.shape[0])
+    if n > 0:
+        dst[:n] += src[:n] * float(gain)
+    return dst
 
 
 def _render_python_instrument_track(
@@ -963,7 +688,6 @@ def _render_python_instrument_track(
     total_n: int,
 ) -> np.ndarray:
     instruments = list(track.instruments) or [BlockInstance("synth_keys", {})]
-
     inst_gens: List[Tuple[BaseBlock, Dict[str, Any]]] = []
 
     for inst in instruments:
@@ -1002,15 +726,22 @@ def _render_python_instrument_track(
             "duration": float(dur_s),
             "sr": int(snap.sr),
             "velocity": velocity,
+            "vel": velocity,
             "note": str(note),
             "octave": int(octv),
+            "start_step": int(ev.start_step),
+            "length_steps": int(ev.length_steps),
         }
 
         layer = np.zeros((dur_n, 2), dtype=np.float32)
 
         for gen, p in inst_gens:
             try:
-                raw, _ = gen.execute(payload, params=p)
+                # IMPORTANT:
+                # Always execute the actual block. Do not bypass synth_keys with
+                # native render_synth_notes here, because the GUI wave controls are
+                # block params like wave/wave_alt/wave_blend/pwm/fm/etc.
+                raw, _ = gen.execute(payload, params={**p, "sr": int(snap.sr)})
                 y = _as_audio_buffer(raw, int(snap.sr)).data
             except Exception as exc:
                 print(f"[pipeline] block '{gen.__class__.__name__}' failed: {exc}")
@@ -1023,7 +754,7 @@ def _render_python_instrument_track(
             elif y.shape[0] > dur_n:
                 y = y[:dur_n]
 
-            layer = NATIVE_DSP.mix_into(layer, y, 1.0)
+            layer = _mix_into(layer, y, 1.0)
 
         a = max(note_a, start_sample)
         b = min(note_b, start_sample + window_n, total_n)
@@ -1054,22 +785,17 @@ def _render_dry_track(
     track = snap.tracks[track_i]
     notes = snap.notes[track_i] if track_i < len(snap.notes) else ()
 
-    instruments = list(track.instruments) or [BlockInstance("synth_keys", {})]
-    all_native = all(str(inst.name).strip().lower() in _NATIVE_SYNTH_NAMES for inst in instruments)
+    key = _track_key(snap, track_i, start_sample, window_n, step_n)
+    cached = _cache_get(key)
 
-    if all_native:
-        return _render_native_synth_track(
-            snap,
-            track,
-            notes,
-            start_sample=start_sample,
-            window_n=window_n,
-            step_s=step_s,
-            step_n=step_n,
-            total_n=total_n,
-        )
+    if cached is not None:
+        return cached
 
-    return _render_python_instrument_track(
+    # IMPORTANT:
+    # This deliberately uses the Python block path for every instrument.
+    # This fixes wave params because each sound block receives the exact params
+    # that the GUI changed.
+    out = _render_python_instrument_track(
         snap,
         track,
         notes,
@@ -1080,35 +806,8 @@ def _render_dry_track(
         total_n=total_n,
     )
 
-
-def _get_dry_track_cached(
-    snap: SequenceSnapshot,
-    track_i: int,
-    *,
-    start_sample: int,
-    window_n: int,
-    step_s: float,
-    step_n: int,
-    total_n: int,
-) -> np.ndarray:
-    key = _dry_track_key(snap, track_i, start_sample, window_n, step_n)
-    hit = _cache_get(key)
-
-    if hit is not None:
-        return hit
-
-    dry = _render_dry_track(
-        snap,
-        track_i,
-        start_sample=start_sample,
-        window_n=window_n,
-        step_s=step_s,
-        step_n=step_n,
-        total_n=total_n,
-    )
-
-    _cache_put(key, dry)
-    return dry
+    _cache_put(key, out)
+    return out
 
 
 def _render_snapshot(
@@ -1118,35 +817,31 @@ def _render_snapshot(
     max_samples: Optional[int] = None,
     common: Dict[str, Any] | None = None,
 ) -> AudioBuffer:
-    common = common or {}
+    common = dict(common or {})
+    total_n = max(0, int(snap.steps_per_bar) * int(snap.bars) * max(1, int(round(((4.0 * (60.0 / max(1e-6, snap.bpm))) / max(1, snap.steps_per_bar)) * snap.sr))))
 
-    step_s = (4.0 * (60.0 / max(1.0e-6, float(snap.bpm)))) / float(max(1, snap.steps_per_bar))
-    step_n = max(1, int(round(step_s * int(snap.sr))))
-
-    total_steps = int(snap.steps_per_bar) * int(snap.bars)
-    total_n = max(0, step_n * total_steps)
-
-    start_sample = int(max(0, min(total_n, int(start_sample))))
-
+    start_sample = int(max(0, start_sample))
     if max_samples is None:
-        window_n = total_n - start_sample
+        window_n = max(0, total_n - start_sample)
     else:
-        window_n = int(max(0, min(total_n - start_sample, int(max_samples))))
+        window_n = max(0, min(int(max_samples), total_n - start_sample))
 
     if window_n <= 0:
-        return AudioBuffer.silence(0, snap.sr)
+        return AudioBuffer.silence(0, int(snap.sr))
 
-    mix = np.zeros((window_n, 2), dtype=np.float32)
+    step_s = (4.0 * (60.0 / max(1e-6, float(snap.bpm)))) / float(max(1, int(snap.steps_per_bar)))
+    step_n = max(1, int(round(step_s * int(snap.sr))))
+
     any_solo = any(bool(t.solo) for t in snap.tracks)
+    out = np.zeros((window_n, 2), dtype=np.float32)
 
     for ti, track in enumerate(snap.tracks):
         if bool(track.mute):
             continue
-
         if any_solo and not bool(track.solo):
             continue
 
-        dry = _get_dry_track_cached(
+        dry = _render_dry_track(
             snap,
             ti,
             start_sample=start_sample,
@@ -1159,12 +854,11 @@ def _render_snapshot(
         tbuf = dry
 
         fx_chain: List[Tuple[BaseBlock, Dict[str, Any]]] = []
-
         for bi in track.fx:
             try:
                 fx_chain.append((BLOCKS.create(bi.name), dict(bi.params or {})))
             except Exception as exc:
-                print(f"[pipeline] missing FX '{bi.name}': {exc}")
+                print(f"[pipeline] missing fx '{bi.name}': {exc}")
 
         if fx_chain:
             try:
@@ -1173,120 +867,93 @@ def _render_snapshot(
                     fx_chain,
                     common={
                         **common,
-                        "preview": bool(max_samples is not None),
                         "sr": int(snap.sr),
+                        "preview": max_samples is not None,
                     },
                 )
-
                 tbuf = _as_audio_buffer(fx_out, int(snap.sr)).data
-
-                if tbuf.shape[0] != window_n:
-                    fixed = np.zeros((window_n, 2), dtype=np.float32)
-                    n = min(window_n, tbuf.shape[0])
-                    fixed[:n] = tbuf[:n]
-                    tbuf = fixed
-
             except Exception as exc:
-                print(f"[pipeline] track FX failed on '{track.name}': {exc}")
+                print(f"[pipeline] fx chain failed: {exc}")
 
-        mix = NATIVE_DSP.mix_into(mix, tbuf, float(track.volume))
+        out = _mix_into(out, tbuf, float(track.volume))
 
-    return AudioBuffer(sanitize_audio(mix), int(snap.sr))
+    return AudioBuffer(sanitize_audio(out), int(snap.sr))
 
 
 # ============================================================================
-# Backward-compatible resource ballast helpers
+# Demo / ballast helpers used by GUI
 # ============================================================================
 
 class MemoryBallast:
     def __init__(self) -> None:
         self._chunks: list[bytearray] = []
-        self._held_bytes = 0
         self._lock = threading.RLock()
 
-    @property
-    def held_mb(self) -> float:
-        with self._lock:
-            return self._held_bytes / (1024.0 * 1024.0)
-
-    def set_target_mb(self, mb: int | float) -> None:
-        target = max(0, int(float(mb) * 1024 * 1024))
-        chunk_size = 16 * 1024 * 1024
+    def set_target_mb(self, mb: int, *args: Any, **kwargs: Any) -> None:
+        mb = int(max(0, mb))
+        chunk_mb = int(kwargs.get("chunk_mb", 16))
+        chunk_mb = max(1, chunk_mb)
 
         with self._lock:
-            while self._held_bytes < target:
-                n = min(chunk_size, target - self._held_bytes)
-                self._chunks.append(bytearray(n))
-                self._held_bytes += n
-
-            while self._chunks and self._held_bytes > target:
-                chunk = self._chunks.pop()
-                self._held_bytes -= len(chunk)
+            self._chunks.clear()
+            remaining = mb
+            while remaining > 0:
+                take = min(chunk_mb, remaining)
+                self._chunks.append(bytearray(take * 1024 * 1024))
+                remaining -= take
 
     def release(self) -> None:
-        self.set_target_mb(0)
+        with self._lock:
+            self._chunks.clear()
 
-    def stats(self) -> Dict[str, Any]:
-        vm = psutil.virtual_memory()._asdict() if psutil else {}
-        return {
-            "held_mb": self.held_mb,
-            "system": vm,
-        }
+    def clear(self) -> None:
+        self.release()
+
+    def held_mb(self) -> float:
+        with self._lock:
+            return float(sum(len(c) for c in self._chunks) / (1024 * 1024))
 
 
 class CpuBallast:
     def __init__(self) -> None:
-        self._threads: list[threading.Thread] = []
-        self._stop = threading.Event()
         self._target_pct = 0
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
         self._lock = threading.RLock()
 
-    @property
-    def target_pct(self) -> int:
-        with self._lock:
-            return int(self._target_pct)
-
-    def set_target_pct(self, pct: int | float) -> None:
-        pct = int(max(0, min(80, float(pct))))
-
+    def set_target_pct(self, pct: int) -> None:
+        pct = int(max(0, min(80, pct)))
         with self._lock:
             self._target_pct = pct
 
-            if pct <= 0:
-                self.stop()
-                return
+        if pct <= 0:
+            self.stop()
+            return
 
-            if self._threads:
-                return
-
+        if self._thread is None or not self._thread.is_alive():
             self._stop.clear()
-            t = threading.Thread(target=self._run, daemon=True)
-            self._threads = [t]
-            t.start()
+            self._thread = threading.Thread(target=self._loop, daemon=True, name="CpuBallast")
+            self._thread.start()
 
-    def _run(self) -> None:
+    def _loop(self) -> None:
         period = 0.05
-
         while not self._stop.is_set():
-            pct = self.target_pct
+            with self._lock:
+                pct = int(self._target_pct)
+
+            if pct <= 0:
+                time.sleep(0.1)
+                continue
+
             busy = period * (pct / 100.0)
-            end = time.perf_counter() + busy
-            x = 0.0
+            idle = max(0.001, period - busy)
+            t0 = time.perf_counter()
 
-            while time.perf_counter() < end and not self._stop.is_set():
-                x += math.sin(x + 0.1)
+            while time.perf_counter() - t0 < busy:
+                _ = math.sqrt(12345.6789)
 
-            sleep = max(0.0, period - busy)
-
-            if sleep:
-                time.sleep(sleep)
+            time.sleep(idle)
 
     def stop(self) -> None:
         self._stop.set()
-
-        for t in list(self._threads):
-            if t.is_alive():
-                t.join(timeout=0.1)
-
-        self._threads.clear()
 

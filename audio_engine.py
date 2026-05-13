@@ -148,6 +148,9 @@ class AudioEngine:
         with self._cond:
             self._request_id += 1
 
+            # A new edit makes older full/preview renders stale. Keep the newest
+            # due time behavior responsive, but never let an older completed job
+            # overwrite a newer sound.
             if self._preview_due is None:
                 self._preview_due = preview_due
             else:
@@ -269,7 +272,10 @@ class AudioEngine:
         elapsed = time.perf_counter() - t0
 
         with self._cond:
-            if request_id != self._request_id and kind == "preview":
+            # Any newer param/note edit makes this render obsolete. This is
+            # critical for live knobs/sliders because a slow full render from an
+            # older value should never swap back over the newest preview.
+            if request_id != self._request_id:
                 return
 
         with self._state_lock:

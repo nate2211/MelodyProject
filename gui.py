@@ -68,6 +68,34 @@ def default_params(block_name: str) -> Dict[str, Any]:
     return {k: v.get("default") for k, v in schema.items()}
 
 
+def coerce_param_value(spec: Dict[str, Any], value: Any) -> Any:
+    """Convert GUI widget values into the exact type the block expects."""
+    ptype = str(spec.get("type", "float")).lower()
+
+    if ptype == "bool":
+        return bool(value)
+
+    if ptype == "int":
+        mn = int(round(float(spec.get("min", -2147483648))))
+        mx = int(round(float(spec.get("max", 2147483647))))
+        return int(max(mn, min(mx, int(round(float(value))))))
+
+    if ptype == "float":
+        mn = float(spec.get("min", -1.0e30))
+        mx = float(spec.get("max", 1.0e30))
+        return float(np.clip(float(value), mn, mx))
+
+    if ptype == "choice":
+        choices = [str(x) for x in spec.get("choices", [])]
+        s = str(value)
+        return s if (not choices or s in choices) else str(spec.get("default", choices[0] if choices else s))
+
+    if ptype == "str":
+        return str(value)
+
+    return value
+
+
 # ============================================================================
 # Pitch / scale helpers
 # ============================================================================
@@ -681,6 +709,8 @@ class MelodyGUI(QMainWindow):
         self._param_lock = threading.RLock()
         self._param_dragging = False
         self._pending_dirty_render = False
+        self._last_param_change: Optional[Tuple[int, str, int, str, Any]] = None
+        self._param_widget_guard = False
 
         self._ballast = MemoryBallast()
         self._ballast_target_mb = 0
@@ -1107,12 +1137,14 @@ class MelodyGUI(QMainWindow):
     # Fast dirty render scheduling
     # ------------------------------------------------------------------
 
-    def _mark_dirty_and_restart_from_playhead(self, *, full_later: bool = True):
+    def _mark_dirty_and_restart_from_playhead(self, *, full_later: bool = True, immediate: bool = False):
         """
         Called after notes, params, FX, instruments, bars, or MIDI change.
 
-        This does not render in the GUI thread.
-        It schedules a fast preview render through AudioEngine.
+        This does not render in the GUI thread. It touches the sequence and
+        schedules preview/full renders on the AudioEngine worker. When playback
+        is active, parameter edits are audible immediately instead of waiting
+        for the next Play press.
         """
         try:
             self.seq.touch()
@@ -1120,10 +1152,20 @@ class MelodyGUI(QMainWindow):
             pass
 
         self._pending_dirty_render = True
-        self._dirty_timer.start()
+
+        if self.audio.is_playing:
+            try:
+                self.audio.request_preview_rerender(
+                    immediate=bool(immediate),
+                    full_later=bool(full_later),
+                )
+            except Exception:
+                pass
+
+        self._dirty_timer.start(1 if immediate else 20)
 
         if full_later:
-            self._full_render_timer.start()
+            self._full_render_timer.start(450 if immediate else 700)
 
     def _apply_dirty_restart(self):
         if not self._pending_dirty_render:
@@ -1132,7 +1174,7 @@ class MelodyGUI(QMainWindow):
         self._pending_dirty_render = False
 
         if self.audio.is_playing:
-            self.audio.request_preview_rerender(immediate=False, full_later=True)
+            self.audio.request_preview_rerender(immediate=True, full_later=True)
 
     def _apply_full_idle_render(self):
         if self.audio.is_playing:
@@ -1154,7 +1196,7 @@ class MelodyGUI(QMainWindow):
             self.seq.tracks[ti].instruments.append(BlockInstance(name, default_params(name)))
 
         self.refresh_stacks(ti)
-        self._mark_dirty_and_restart_from_playhead()
+        self._mark_dirty_and_restart_from_playhead(immediate=True)
 
     def remove_instrument(self):
         ti = self.current_track_index()
@@ -1175,7 +1217,7 @@ class MelodyGUI(QMainWindow):
 
         self.refresh_stacks(ti)
         self.clear_param_editor()
-        self._mark_dirty_and_restart_from_playhead()
+        self._mark_dirty_and_restart_from_playhead(immediate=True)
 
     def add_fx(self):
         ti = self.current_track_index()
@@ -1189,7 +1231,7 @@ class MelodyGUI(QMainWindow):
             self.seq.tracks[ti].fx.append(BlockInstance(name, default_params(name)))
 
         self.refresh_stacks(ti)
-        self._mark_dirty_and_restart_from_playhead()
+        self._mark_dirty_and_restart_from_playhead(immediate=True)
 
     def remove_fx(self):
         ti = self.current_track_index()
@@ -1210,7 +1252,7 @@ class MelodyGUI(QMainWindow):
 
         self.refresh_stacks(ti)
         self.clear_param_editor()
-        self._mark_dirty_and_restart_from_playhead()
+        self._mark_dirty_and_restart_from_playhead(immediate=True)
 
     # ------------------------------------------------------------------
     # Ballast controls
@@ -1346,6 +1388,23 @@ class MelodyGUI(QMainWindow):
         self._clear_param_rows()
         self._editing = None
 
+    def _current_block_instance(self) -> Optional[BlockInstance]:
+        if not self._editing:
+            return None
+
+        ti, stack_name, bi_idx = self._editing
+
+        if not (0 <= ti < len(self.seq.tracks)):
+            return None
+
+        tr = self.seq.tracks[ti]
+        chain = tr.instruments if stack_name == "instruments" else tr.fx
+
+        if not (0 <= bi_idx < len(chain)):
+            return None
+
+        return chain[bi_idx]
+
     def select_block_for_edit(self, stack_name: str):
         ti = self.current_track_index()
 
@@ -1384,17 +1443,25 @@ class MelodyGUI(QMainWindow):
             self.params_form.addRow(QLabel("(No params)"), QLabel(""))
             return
 
+        self._param_widget_guard = True
+
         with self._param_lock:
             for key, spec in schema.items():
-                params.setdefault(key, spec.get("default"))
+                if key not in params:
+                    params[key] = spec.get("default")
+                else:
+                    try:
+                        params[key] = coerce_param_value(spec, params[key])
+                    except Exception:
+                        params[key] = spec.get("default")
 
         for key, spec in schema.items():
-            ptype = spec.get("type", "float")
+            ptype = str(spec.get("type", "float")).lower()
             default = spec.get("default")
 
             if ptype == "bool":
                 w = QCheckBox()
-                w.setChecked(bool(params.get(key)))
+                w.setChecked(bool(params.get(key, default)))
                 w.toggled.connect(lambda checked, k=key: self._set_param(k, bool(checked)))
                 self.params_form.addRow(QLabel(key), w)
                 continue
@@ -1408,14 +1475,17 @@ class MelodyGUI(QMainWindow):
 
             if ptype == "choice":
                 w = QComboBox()
-                choices = list(spec.get("choices", []))
+                choices = [str(c) for c in spec.get("choices", [])]
 
                 for c in choices:
                     w.addItem(str(c))
 
                 cur = str(params.get(key, default))
 
-                if cur in [str(x) for x in choices]:
+                if choices and cur not in choices:
+                    cur = str(default if default is not None else choices[0])
+
+                if cur in choices:
                     w.setCurrentText(cur)
 
                 w.currentTextChanged.connect(lambda val, k=key: self._set_param(k, val))
@@ -1456,13 +1526,12 @@ class MelodyGUI(QMainWindow):
 
             sld.blockSignals(True)
             spn.blockSignals(True)
-
             sld.setValue(_value_to_slider(cur_v, mn, step, steps_int))
 
             if is_int:
                 spn.setValue(int(round(cur_v)))
             else:
-                spn.setValue(cur_v)
+                spn.setValue(float(cur_v))
 
             sld.blockSignals(False)
             spn.blockSignals(False)
@@ -1480,17 +1549,15 @@ class MelodyGUI(QMainWindow):
             ):
                 v = _slider_to_value(int(val), mn_, step_)
 
+                spin.blockSignals(True)
                 if is_int_:
                     v = int(round(v))
-                    spin.blockSignals(True)
                     spin.setValue(v)
-                    spin.blockSignals(False)
-                    self._set_param(k, v)
                 else:
-                    spin.blockSignals(True)
                     spin.setValue(float(v))
-                    spin.blockSignals(False)
-                    self._set_param(k, float(v))
+                spin.blockSignals(False)
+
+                self._set_param(k, v)
 
             def on_spin(
                 val,
@@ -1515,22 +1582,34 @@ class MelodyGUI(QMainWindow):
 
             h.addWidget(sld, 1)
             h.addWidget(spn, 0)
-
             self.params_form.addRow(QLabel(key), row)
+
+        self._param_widget_guard = False
 
     def _begin_param_drag(self):
         self._param_dragging = True
 
     def _end_param_drag(self):
         self._param_dragging = False
-        self._mark_dirty_and_restart_from_playhead(full_later=True)
+        self._mark_dirty_and_restart_from_playhead(full_later=True, immediate=True)
 
         if self.audio.is_playing:
             self.audio.request_full_rerender(immediate=False)
 
     def _set_param(self, key: str, value: Any):
-        if not self._editing:
+        if self._param_widget_guard:
             return
+
+        blk = self._current_block_instance()
+        if blk is None or not self._editing:
+            return
+
+        spec = block_params_schema(blk.name).get(str(key), {"type": "float"})
+
+        try:
+            value = coerce_param_value(spec, value)
+        except Exception:
+            value = spec.get("default", value)
 
         ti, stack_name, bi = self._editing
         chain_kind = "instrument" if stack_name == "instruments" else "fx"
@@ -1570,10 +1649,36 @@ class MelodyGUI(QMainWindow):
             return
 
         with self._param_lock:
-            chain[int(block_i)].params[str(param_name)] = value
+            blk = chain[int(block_i)]
+            old_value = blk.params.get(str(param_name))
+
+            if old_value == value:
+                return
+
+            # Reassign a fresh dict so the render worker sees a consistent
+            # snapshot and parameter controls cannot mutate a dict mid-render.
+            new_params = dict(blk.params)
+            new_params[str(param_name)] = value
+            blk.params = new_params
+
+            try:
+                self.seq.touch()
+            except Exception:
+                pass
+
+            self._last_param_change = (
+                int(track_i),
+                str(chain_kind),
+                int(block_i),
+                str(param_name),
+                value,
+            )
 
         if live:
-            self._mark_dirty_and_restart_from_playhead(full_later=not self._param_dragging)
+            self._mark_dirty_and_restart_from_playhead(
+                full_later=not self._param_dragging,
+                immediate=True,
+            )
 
     # ------------------------------------------------------------------
     # MIDI import
