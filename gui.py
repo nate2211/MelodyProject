@@ -481,8 +481,20 @@ class PianoRollView(QGraphicsView):
             h = self.layout.row_h
 
             ni = NoteItem(QRectF(x + 1, y + 1, w - 2, h - 2))
-            ni.setBrush(QBrush(QColor(60, 150, 255)))
-            ni.setOpacity(0.95)
+            if self.owner._selected_note == (ti, idx):
+                ni.setBrush(QBrush(QColor(255, 176, 72)))
+                ni.setOpacity(1.0)
+            else:
+                ni.setBrush(QBrush(QColor(60, 150, 255)))
+                ni.setOpacity(0.95)
+
+            ni.setToolTip(
+                f"{ev.pitch[0]}{ev.pitch[1]} | step {ev.start_step} | len {ev.length_steps}\n"
+                f"A {float(getattr(ev, 'attack', 0.005)):.3f}s  "
+                f"D {float(getattr(ev, 'decay', 0.040)):.3f}s  "
+                f"S {float(getattr(ev, 'sustain', 0.80)):.2f}  "
+                f"R {float(getattr(ev, 'release', 0.080)):.3f}s"
+            )
             sc.addItem(ni)
 
             self._note_items.append(ni)
@@ -525,6 +537,21 @@ class PianoRollView(QGraphicsView):
         h = self.layout.row_h
 
         item.setRect(QRectF(x + 1, y + 1, w - 2, h - 2))
+
+        if self.owner._selected_note == (ti, note_idx):
+            item.setBrush(QBrush(QColor(255, 176, 72)))
+            item.setOpacity(1.0)
+        else:
+            item.setBrush(QBrush(QColor(60, 150, 255)))
+            item.setOpacity(0.95)
+
+        item.setToolTip(
+            f"{ev.pitch[0]}{ev.pitch[1]} | step {ev.start_step} | len {ev.length_steps}\n"
+            f"A {float(getattr(ev, 'attack', 0.005)):.3f}s  "
+            f"D {float(getattr(ev, 'decay', 0.040)):.3f}s  "
+            f"S {float(getattr(ev, 'sustain', 0.80)):.2f}  "
+            f"R {float(getattr(ev, 'release', 0.080)):.3f}s"
+        )
 
     # ------------------------------------------------------------------
     # Interaction
@@ -569,6 +596,7 @@ class PianoRollView(QGraphicsView):
             idx = self.owner.seq.find_note_covering(ti, step, pitch)
 
             if idx is not None:
+                self.owner.select_note_for_edit(ti, idx)
                 ev0 = self.owner.seq.notes[ti][idx]
                 self._dragging = True
                 self._drag_start_step = int(ev0.start_step)
@@ -589,6 +617,7 @@ class PianoRollView(QGraphicsView):
             self._drag_moved = False
             self._drag_last_len = 1
 
+            self.owner.select_note_for_edit(ti, new_idx)
             self.owner.rebuild_roll(grid=False, notes=True)
             ev.accept()
             return
@@ -613,6 +642,8 @@ class PianoRollView(QGraphicsView):
 
             if idx is not None:
                 self.owner.seq.remove_note(ti, idx)
+                if self.owner._selected_note == (ti, idx):
+                    self.owner.clear_note_param_editor()
                 self.owner.rebuild_roll(grid=False, notes=True)
                 self.owner._mark_dirty_and_restart_from_playhead()
 
@@ -661,10 +692,12 @@ class PianoRollView(QGraphicsView):
             idx = self._drag_note_index
 
             if self._drag_was_existing and (not self._drag_moved) and idx is not None:
-                self.owner.seq.remove_note(ti, idx)
+                self.owner.select_note_for_edit(ti, idx)
                 self.owner.rebuild_roll(grid=False, notes=True)
             else:
-                self.owner.rebuild_roll(grid=False, notes=False)
+                if idx is not None:
+                    self.owner.select_note_for_edit(ti, idx)
+                self.owner.rebuild_roll(grid=False, notes=True)
 
             self._dragging = False
             self._drag_note_index = None
@@ -706,11 +739,14 @@ class MelodyGUI(QMainWindow):
         self._ghost_scale: Optional[str] = None
 
         self._editing: Optional[Tuple[int, str, int]] = None
+        self._selected_note: Optional[Tuple[int, int]] = None
         self._param_lock = threading.RLock()
         self._param_dragging = False
+        self._note_param_dragging = False
         self._pending_dirty_render = False
         self._last_param_change: Optional[Tuple[int, str, int, str, Any]] = None
         self._param_widget_guard = False
+        self._note_widget_guard = False
 
         self._ballast = MemoryBallast()
         self._ballast_target_mb = 0
@@ -945,6 +981,21 @@ class MelodyGUI(QMainWindow):
         fx_box.setMinimumHeight(150)
         right_split.addWidget(fx_box)
 
+        self.note_params_outer = QGroupBox("Selected Note Params")
+        note_outer_v = QVBoxLayout(self.note_params_outer)
+        note_outer_v.setContentsMargins(10, 10, 10, 10)
+
+        self.note_params_scroll = QScrollArea()
+        self.note_params_scroll.setWidgetResizable(True)
+        note_outer_v.addWidget(self.note_params_scroll, 1)
+
+        self.note_params_inner = QWidget()
+        self.note_params_form = QFormLayout(self.note_params_inner)
+        self.note_params_scroll.setWidget(self.note_params_inner)
+
+        self.note_params_outer.setMinimumHeight(220)
+        right_split.addWidget(self.note_params_outer)
+
         self.params_outer = QGroupBox("Block Params")
         outer_v = QVBoxLayout(self.params_outer)
         outer_v.setContentsMargins(10, 10, 10, 10)
@@ -963,8 +1014,9 @@ class MelodyGUI(QMainWindow):
         right_split.setStretchFactor(0, 0)
         right_split.setStretchFactor(1, 1)
         right_split.setStretchFactor(2, 1)
-        right_split.setStretchFactor(3, 3)
-        right_split.setSizes([150, 220, 220, 380])
+        right_split.setStretchFactor(3, 2)
+        right_split.setStretchFactor(4, 3)
+        right_split.setSizes([130, 190, 190, 240, 330])
 
         lr_split.addWidget(left_pane)
         lr_split.addWidget(right_pane)
@@ -974,6 +1026,7 @@ class MelodyGUI(QMainWindow):
         self.refresh_tracks()
         self.track_list.setCurrentRow(0)
         self.rebuild_roll()
+        self.clear_note_param_editor()
         self._update_mem_label()
 
         act = QAction(self)
@@ -1106,6 +1159,7 @@ class MelodyGUI(QMainWindow):
 
         self.refresh_stacks(idx)
         self.clear_param_editor()
+        self.clear_note_param_editor()
         self.rebuild_roll()
 
     def refresh_stacks(self, track_i: int):
@@ -1124,6 +1178,7 @@ class MelodyGUI(QMainWindow):
 
     def rebuild_roll(self, *, grid: bool = True, notes: bool = True):
         self.seq.ensure()
+        self._sync_selected_note_validity()
 
         if grid:
             self.roll.rebuild_grid()
@@ -1375,6 +1430,315 @@ class MelodyGUI(QMainWindow):
 
         except Exception:
             self.mem_label.setText("RSS: ? MB")
+
+    # ------------------------------------------------------------------
+    # Selected note param editor
+    # ------------------------------------------------------------------
+
+    def _clear_note_param_rows(self):
+        if not hasattr(self, "note_params_form"):
+            return
+
+        while self.note_params_form.rowCount():
+            self.note_params_form.removeRow(0)
+
+    def _sync_selected_note_validity(self):
+        if self._selected_note is None:
+            return
+
+        ti, ni = self._selected_note
+
+        if not (0 <= int(ti) < len(self.seq.notes)):
+            self._selected_note = None
+            return
+
+        if not (0 <= int(ni) < len(self.seq.notes[int(ti)])):
+            self._selected_note = None
+            return
+
+    def _current_note_event(self):
+        self.seq.ensure()
+        self._sync_selected_note_validity()
+
+        if self._selected_note is None:
+            return None
+
+        ti, ni = self._selected_note
+
+        if not (0 <= ti < len(self.seq.notes)):
+            return None
+        if not (0 <= ni < len(self.seq.notes[ti])):
+            return None
+
+        return self.seq.notes[ti][ni]
+
+    def clear_note_param_editor(self):
+        self._selected_note = None
+        self._clear_note_param_rows()
+
+        if hasattr(self, "note_params_form"):
+            self.note_params_form.addRow(QLabel("No note selected"), QLabel("Click a note in the piano roll"))
+
+        if hasattr(self, "roll"):
+            try:
+                self.roll.rebuild_notes()
+            except Exception:
+                pass
+
+    def select_note_for_edit(self, track_i: int, note_index: int):
+        self.seq.ensure()
+
+        if not (0 <= int(track_i) < len(self.seq.notes)):
+            self.clear_note_param_editor()
+            return
+
+        if not (0 <= int(note_index) < len(self.seq.notes[int(track_i)])):
+            self.clear_note_param_editor()
+            return
+
+        self._selected_note = (int(track_i), int(note_index))
+        self.build_note_param_editor()
+
+        try:
+            self.roll.rebuild_notes()
+        except Exception:
+            pass
+
+    def _add_note_slider_row(
+        self,
+        label: str,
+        key: str,
+        value: float,
+        *,
+        minimum: float,
+        maximum: float,
+        step: float,
+        decimals: int = 3,
+        is_int: bool = False,
+    ):
+        spec = {
+            "type": "int" if is_int else "float",
+            "min": float(minimum),
+            "max": float(maximum),
+            "step": float(step),
+            "decimals": int(decimals),
+            "default": float(value),
+        }
+
+        mn, mx, actual_step, steps_int = _slider_steps_for_spec(spec, is_int=is_int)
+
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(8)
+
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setMinimum(0)
+        slider.setMaximum(steps_int)
+        slider.setSingleStep(1)
+        slider.setPageStep(max(1, steps_int // 20))
+
+        if is_int:
+            spin = QSpinBox()
+            spin.setMinimum(int(round(mn)))
+            spin.setMaximum(int(round(mx)))
+            spin.setSingleStep(max(1, int(round(step))))
+            spin.setFixedWidth(90)
+            cur_v = int(round(float(np.clip(value, mn, mx))))
+        else:
+            spin = QDoubleSpinBox()
+            spin.setDecimals(int(decimals))
+            spin.setMinimum(float(mn))
+            spin.setMaximum(float(mx))
+            spin.setSingleStep(float(step))
+            spin.setFixedWidth(110)
+            cur_v = float(np.clip(float(value), mn, mx))
+
+        slider.blockSignals(True)
+        spin.blockSignals(True)
+        slider.setValue(_value_to_slider(float(cur_v), mn, actual_step, steps_int))
+        spin.setValue(cur_v)
+        slider.blockSignals(False)
+        spin.blockSignals(False)
+
+        slider.sliderPressed.connect(self._begin_note_param_drag)
+        slider.sliderReleased.connect(self._end_note_param_drag)
+
+        def on_slider(
+            slider_value,
+            k=key,
+            spin_widget=spin,
+            mn_=mn,
+            step_=actual_step,
+            is_int_=is_int,
+        ):
+            v = _slider_to_value(int(slider_value), mn_, step_)
+
+            spin_widget.blockSignals(True)
+            if is_int_:
+                v = int(round(v))
+                spin_widget.setValue(v)
+            else:
+                spin_widget.setValue(float(v))
+            spin_widget.blockSignals(False)
+
+            self._set_note_param(k, v)
+
+        def on_spin(
+            spin_value,
+            k=key,
+            slider_widget=slider,
+            mn_=mn,
+            mx_=mx,
+            step_=actual_step,
+            steps_=steps_int,
+            is_int_=is_int,
+        ):
+            v = float(np.clip(float(spin_value), mn_, mx_))
+
+            slider_widget.blockSignals(True)
+            slider_widget.setValue(_value_to_slider(v, mn_, step_, steps_))
+            slider_widget.blockSignals(False)
+
+            self._set_note_param(k, int(round(v)) if is_int_ else float(v))
+
+        slider.valueChanged.connect(on_slider)
+        spin.valueChanged.connect(on_spin)
+
+        h.addWidget(slider, 1)
+        h.addWidget(spin, 0)
+        self.note_params_form.addRow(QLabel(label), row)
+
+    def build_note_param_editor(self):
+        self._clear_note_param_rows()
+        self.seq.ensure()
+        self._sync_selected_note_validity()
+
+        if self._selected_note is None:
+            self.note_params_form.addRow(QLabel("No note selected"), QLabel("Click a note in the piano roll"))
+            return
+
+        ti, ni = self._selected_note
+        ev = self.seq.notes[ti][ni]
+
+        self._note_widget_guard = True
+
+        name = f"{ev.pitch[0]}{ev.pitch[1]}"
+        self.note_params_form.addRow(QLabel("Note"), QLabel(name))
+        self.note_params_form.addRow(QLabel("Start step"), QLabel(str(int(ev.start_step))))
+
+        max_len = max(1, int(self.seq.total_steps()) - int(ev.start_step))
+        self._add_note_slider_row(
+            "Length steps",
+            "length_steps",
+            float(max(1, int(ev.length_steps))),
+            minimum=1,
+            maximum=max_len,
+            step=1,
+            decimals=0,
+            is_int=True,
+        )
+        self._add_note_slider_row(
+            "Velocity",
+            "velocity",
+            float(getattr(ev, "velocity", 1.0)),
+            minimum=0.0,
+            maximum=2.0,
+            step=0.01,
+            decimals=2,
+        )
+        self._add_note_slider_row(
+            "Attack (s)",
+            "attack",
+            float(getattr(ev, "attack", 0.005)),
+            minimum=0.0,
+            maximum=5.0,
+            step=0.001,
+            decimals=3,
+        )
+        self._add_note_slider_row(
+            "Decay (s)",
+            "decay",
+            float(getattr(ev, "decay", 0.040)),
+            minimum=0.0,
+            maximum=5.0,
+            step=0.001,
+            decimals=3,
+        )
+        self._add_note_slider_row(
+            "Sustain",
+            "sustain",
+            float(getattr(ev, "sustain", 0.80)),
+            minimum=0.0,
+            maximum=2.0,
+            step=0.01,
+            decimals=2,
+        )
+        self._add_note_slider_row(
+            "Release (s)",
+            "release",
+            float(getattr(ev, "release", 0.080)),
+            minimum=0.0,
+            maximum=8.0,
+            step=0.001,
+            decimals=3,
+        )
+
+        self._note_widget_guard = False
+
+    def _begin_note_param_drag(self):
+        self._note_param_dragging = True
+
+    def _end_note_param_drag(self):
+        self._note_param_dragging = False
+        self._mark_dirty_and_restart_from_playhead(full_later=True, immediate=True)
+
+        if self.audio.is_playing:
+            self.audio.request_full_rerender(immediate=False)
+
+    def _set_note_param(self, key: str, value: Any):
+        if self._note_widget_guard:
+            return
+
+        self.seq.ensure()
+        self._sync_selected_note_validity()
+
+        if self._selected_note is None:
+            return
+
+        ti, ni = self._selected_note
+        key = str(key).strip().lower()
+
+        with self._param_lock:
+            try:
+                if hasattr(self.seq, "set_note_param"):
+                    self.seq.set_note_param(ti, ni, key, value)
+                elif key == "velocity":
+                    self.seq.set_note_velocity(ti, ni, float(value))
+                elif key == "length_steps":
+                    self.seq.set_note_length(ti, ni, int(value))
+                elif key in {"attack", "decay", "sustain", "release"}:
+                    ev = self.seq.notes[ti][ni]
+                    setattr(ev, key, float(value))
+                    self.seq.touch()
+                else:
+                    return
+            except Exception:
+                return
+
+        try:
+            if key == "length_steps":
+                self.roll.update_note_item(ni)
+            elif self._selected_note is not None:
+                self.roll.update_note_item(ni)
+        except Exception:
+            pass
+
+        self._mark_dirty_and_restart_from_playhead(
+            full_later=not self._note_param_dragging,
+            immediate=True,
+        )
+
 
     # ------------------------------------------------------------------
     # Param editor

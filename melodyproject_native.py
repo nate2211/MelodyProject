@@ -146,6 +146,77 @@ def _python_render_synth_notes(
     return out.astype(np.float32, copy=False)
 
 
+
+def _python_apply_note_adsr(
+    audio: np.ndarray,
+    *,
+    sample_rate: int,
+    hold_frames: int,
+    attack: float,
+    decay: float,
+    sustain: float,
+    release: float,
+    curve: float = 1.0,
+) -> np.ndarray:
+    x = ensure_stereo(audio).copy()
+
+    if x.size == 0:
+        return x
+
+    frames = int(x.shape[0])
+    sample_rate = int(max(1, sample_rate))
+    hold_frames = int(max(1, min(frames, int(hold_frames))))
+
+    attack = max(0.0, float(attack))
+    decay = max(0.0, float(decay))
+    sustain = float(np.clip(float(sustain), 0.0, 2.0))
+    release = max(0.0, float(release))
+    curve = float(np.clip(float(curve), 0.15, 2.5))
+
+    attack_n = max(0, int(round(attack * sample_rate)))
+    decay_n = max(0, int(round(decay * sample_rate)))
+    release_n = max(0, int(round(release * sample_rate)))
+
+    if attack_n + decay_n > hold_frames:
+        total = max(1, attack_n + decay_n)
+        scale = float(hold_frames) / float(total)
+        attack_n = int(round(attack_n * scale))
+        decay_n = max(0, hold_frames - attack_n)
+
+    def hold_env_at(j: int) -> float:
+        j = int(max(0, min(hold_frames - 1, j)))
+
+        if attack_n == 0 and decay_n == 0:
+            if j == 0:
+                return float(max(sustain, 1.0))
+            return float(sustain)
+
+        if attack_n > 0 and j < attack_n:
+            v = float(np.clip(j / float(max(1, attack_n)), 0.0, 1.0))
+            return float(np.clip(v ** (1.0 / curve), 0.0, 2.0))
+
+        if decay_n > 0 and j < attack_n + decay_n:
+            v = float(np.clip((j - attack_n) / float(max(1, decay_n)), 0.0, 1.0))
+            shaped = v ** curve
+            return float(np.clip(1.0 + (sustain - 1.0) * shaped, 0.0, 2.0))
+
+        return float(sustain)
+
+    env = np.zeros((frames,), dtype=np.float32)
+
+    for i in range(hold_frames):
+        env[i] = hold_env_at(i)
+
+    if release_n > 0 and hold_frames < frames:
+        rel_end = min(frames, hold_frames + release_n)
+        hold_level = hold_env_at(hold_frames - 1)
+        for i in range(hold_frames, rel_end):
+            v = float(np.clip((i - hold_frames) / float(max(1, release_n)), 0.0, 1.0))
+            env[i] = float(np.clip(hold_level * ((1.0 - v) ** (1.0 / curve)), 0.0, 2.0))
+
+    x *= env[:, None]
+    return x.astype(np.float32, copy=False)
+
 def _python_soft_clip_normalize(
     audio: np.ndarray,
     *,
@@ -251,6 +322,7 @@ class MelodyProjectNative:
         self.load_error: Optional[str] = None
         self.available: bool = False
         self.native_sounds_available: bool = False
+        self.note_envelope_available: bool = False
         self.version: Optional[int] = None
         self.lib: Optional[ctypes.CDLL] = None
         self._lock = threading.RLock()
@@ -375,6 +447,14 @@ class MelodyProjectNative:
                     [C_FLOAT_P, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float],
                     ctypes.c_int,
                 )
+
+                self.note_envelope_available = self._bind_optional(
+                    lib,
+                    "mp_apply_note_adsr_stereo_f32",
+                    [C_FLOAT_P, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float],
+                    ctypes.c_int,
+                )
+
                 optional_ok &= self._bind_optional(
                     lib,
                     "mp_waveshape_stereo_f32",
@@ -533,6 +613,7 @@ class MelodyProjectNative:
         self.version = None
         self.available = False
         self.native_sounds_available = False
+        self.note_envelope_available = False
         self.load_error = last_error or "MelodyProject.dll not found"
 
     def status(self) -> Dict[str, Any]:
@@ -540,6 +621,7 @@ class MelodyProjectNative:
             "enabled": True,
             "available": bool(self.available),
             "native_sounds_available": bool(self.native_sounds_available),
+            "note_envelope_available": bool(self.note_envelope_available),
             "dll_path": self.dll_path,
             "load_error": self.load_error,
             "version": self.version,
@@ -918,6 +1000,61 @@ class MelodyProjectNative:
                 self._float_ptr(x),
                 ctypes.c_int(int(x.shape[0])),
                 ctypes.c_int(int(sample_rate)),
+                ctypes.c_float(float(attack)),
+                ctypes.c_float(float(decay)),
+                ctypes.c_float(float(sustain)),
+                ctypes.c_float(float(release)),
+                ctypes.c_float(float(curve)),
+            )
+        )
+
+        return x
+
+
+    def apply_note_adsr(
+        self,
+        audio: np.ndarray,
+        *,
+        sample_rate: int,
+        hold_frames: Optional[int] = None,
+        hold_seconds: Optional[float] = None,
+        attack: float,
+        decay: float,
+        sustain: float,
+        release: float,
+        curve: float = 1.0,
+    ) -> np.ndarray:
+        x = ensure_stereo(audio).copy()
+
+        if x.size == 0:
+            return x
+
+        if hold_frames is None:
+            if hold_seconds is None:
+                hold_frames = int(x.shape[0])
+            else:
+                hold_frames = int(round(max(0.0, float(hold_seconds)) * int(sample_rate)))
+
+        hold_frames = int(max(1, min(int(x.shape[0]), int(hold_frames))))
+
+        if not self._has("mp_apply_note_adsr_stereo_f32"):
+            return _python_apply_note_adsr(
+                x,
+                sample_rate=int(sample_rate),
+                hold_frames=int(hold_frames),
+                attack=float(attack),
+                decay=float(decay),
+                sustain=float(sustain),
+                release=float(release),
+                curve=float(curve),
+            )
+
+        self._check(
+            self.lib.mp_apply_note_adsr_stereo_f32(
+                self._float_ptr(x),
+                ctypes.c_int(int(x.shape[0])),
+                ctypes.c_int(int(sample_rate)),
+                ctypes.c_int(int(hold_frames)),
                 ctypes.c_float(float(attack)),
                 ctypes.c_float(float(decay)),
                 ctypes.c_float(float(sustain)),

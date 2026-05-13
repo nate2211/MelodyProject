@@ -342,12 +342,24 @@ class NoteEvent:
     length_steps: int = 1
     velocity: float = 1.0
 
+    # Per-note amplitude envelope. These are seconds except sustain, which is a
+    # level multiplier. They are applied after the selected instrument renders,
+    # so every block hears the actual note-level ADSR during playback/export.
+    attack: float = 0.005
+    decay: float = 0.040
+    sustain: float = 0.80
+    release: float = 0.080
+
     def clone(self) -> "NoteEvent":
         return NoteEvent(
             pitch=(str(self.pitch[0]), int(self.pitch[1])),
             start_step=int(self.start_step),
             length_steps=max(1, int(self.length_steps)),
             velocity=float(np.clip(self.velocity, 0.0, 2.0)),
+            attack=float(np.clip(float(self.attack), 0.0, 8.0)),
+            decay=float(np.clip(float(self.decay), 0.0, 8.0)),
+            sustain=float(np.clip(float(self.sustain), 0.0, 2.0)),
+            release=float(np.clip(float(self.release), 0.0, 8.0)),
         )
 
 
@@ -491,6 +503,128 @@ def _fade_edges(x: np.ndarray, fade_n: int) -> np.ndarray:
 
     return y.astype(np.float32, copy=False)
 
+
+def _note_adsr_values(ev: NoteEvent) -> Tuple[float, float, float, float]:
+    """Return safe attack/decay/sustain/release values for one note."""
+    return (
+        float(np.clip(float(getattr(ev, "attack", 0.005)), 0.0, 8.0)),
+        float(np.clip(float(getattr(ev, "decay", 0.040)), 0.0, 8.0)),
+        float(np.clip(float(getattr(ev, "sustain", 0.80)), 0.0, 2.0)),
+        float(np.clip(float(getattr(ev, "release", 0.080)), 0.0, 8.0)),
+    )
+
+
+def _adsr_envelope(
+    frames: int,
+    sr: int,
+    *,
+    hold_s: float,
+    attack: float,
+    decay: float,
+    sustain: float,
+    release: float,
+) -> np.ndarray:
+    """
+    Build a note-level ADSR envelope.
+
+    The hold section equals the piano-roll note length. Release begins exactly
+    when the note length ends, which means changing release on one selected note
+    changes playback and WAV export for that note only.
+    """
+    frames = int(max(0, frames))
+    sr = int(max(1, sr))
+
+    if frames <= 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    hold_n = int(max(1, round(max(0.0, float(hold_s)) * sr)))
+    hold_n = int(min(hold_n, frames))
+
+    attack_n = int(round(max(0.0, float(attack)) * sr))
+    decay_n = int(round(max(0.0, float(decay)) * sr))
+    release_n = int(round(max(0.0, float(release)) * sr))
+    sustain = float(np.clip(float(sustain), 0.0, 2.0))
+
+    # Keep attack+decay inside the piano-roll note body.
+    if attack_n + decay_n > hold_n:
+        total = max(1, attack_n + decay_n)
+        scale = float(hold_n) / float(total)
+        attack_n = int(round(attack_n * scale))
+        decay_n = int(max(0, hold_n - attack_n))
+
+    env = np.zeros((frames,), dtype=np.float32)
+
+    pos = 0
+
+    if attack_n > 0:
+        end = min(frames, attack_n)
+        env[:end] = np.linspace(0.0, 1.0, end, endpoint=False, dtype=np.float32)
+        pos = end
+    else:
+        pos = 0
+
+    if pos < hold_n:
+        if decay_n > 0:
+            end = min(hold_n, pos + decay_n)
+            env[pos:end] = np.linspace(1.0, sustain, end - pos, endpoint=False, dtype=np.float32)
+            pos = end
+
+        if pos < hold_n:
+            env[pos:hold_n] = sustain
+
+    if hold_n > 0:
+        if attack_n == 0 and decay_n == 0 and hold_n > 0:
+            env[:hold_n] = sustain
+            env[0] = max(env[0], 1.0)
+
+        hold_level = float(env[hold_n - 1])
+
+        if release_n > 0 and hold_n < frames:
+            rel_end = min(frames, hold_n + release_n)
+            env[hold_n:rel_end] = np.linspace(hold_level, 0.0, rel_end - hold_n, endpoint=False, dtype=np.float32)
+
+    return np.clip(env, 0.0, 2.0).astype(np.float32, copy=False)
+
+
+
+def _apply_note_adsr_native_or_python(
+    audio: np.ndarray,
+    sr: int,
+    *,
+    hold_s: float,
+    attack: float,
+    decay: float,
+    sustain: float,
+    release: float,
+) -> np.ndarray:
+    x = ensure_stereo(audio).astype(np.float32, copy=False)
+    hold_frames = int(max(1, round(max(0.0, float(hold_s)) * int(max(1, sr)))))
+
+    if NATIVE_DSP is not None and hasattr(NATIVE_DSP, "apply_note_adsr"):
+        try:
+            return NATIVE_DSP.apply_note_adsr(
+                x,
+                sample_rate=int(sr),
+                hold_frames=int(hold_frames),
+                attack=float(attack),
+                decay=float(decay),
+                sustain=float(sustain),
+                release=float(release),
+                curve=1.0,
+            )
+        except Exception:
+            pass
+
+    env = _adsr_envelope(
+        int(x.shape[0]),
+        int(sr),
+        hold_s=float(hold_s),
+        attack=float(attack),
+        decay=float(decay),
+        sustain=float(sustain),
+        release=float(release),
+    )
+    return (x * env[:, None]).astype(np.float32, copy=False)
 
 def _dc_block_stereo(x: np.ndarray, amount: float = 0.995) -> np.ndarray:
     y = ensure_stereo(x).astype(np.float32, copy=False)
@@ -922,6 +1056,55 @@ class Sequence:
                 self._version += 1
                 clear_render_cache()
 
+    def set_note_adsr(
+        self,
+        track_i: int,
+        note_index: int,
+        *,
+        attack: Optional[float] = None,
+        decay: Optional[float] = None,
+        sustain: Optional[float] = None,
+        release: Optional[float] = None,
+    ) -> None:
+        self.ensure()
+
+        with self._lock:
+            if not (0 <= int(track_i) < len(self.notes)):
+                return
+            if not (0 <= int(note_index) < len(self.notes[int(track_i)])):
+                return
+
+            ev = self.notes[int(track_i)][int(note_index)]
+
+            if attack is not None:
+                ev.attack = float(np.clip(float(attack), 0.0, 8.0))
+            if decay is not None:
+                ev.decay = float(np.clip(float(decay), 0.0, 8.0))
+            if sustain is not None:
+                ev.sustain = float(np.clip(float(sustain), 0.0, 2.0))
+            if release is not None:
+                ev.release = float(np.clip(float(release), 0.0, 8.0))
+
+            self._version += 1
+            clear_render_cache()
+
+    def set_note_param(self, track_i: int, note_index: int, param_name: str, value: Any) -> None:
+        name = str(param_name).strip().lower()
+
+        if name == "velocity":
+            self.set_note_velocity(track_i, note_index, float(value))
+            return
+
+        if name == "length_steps":
+            self.set_note_length(track_i, note_index, int(value))
+            return
+
+        if name in {"attack", "decay", "sustain", "release"}:
+            kwargs = {"attack": None, "decay": None, "sustain": None, "release": None}
+            kwargs[name] = float(value)
+            self.set_note_adsr(track_i, note_index, **kwargs)
+            return
+
     def toggle_note_at(self, track_i: int, start_step: int, pitch: Tuple[str, int]) -> None:
         idx = self.find_note_starting_at(track_i, start_step, pitch)
 
@@ -1013,6 +1196,15 @@ def _make_note_payload(
         "velocity": velocity,
         "vel": velocity,
 
+        "attack": float(getattr(ev, "attack", 0.005)),
+        "attack_s": float(getattr(ev, "attack", 0.005)),
+        "decay": float(getattr(ev, "decay", 0.040)),
+        "decay_s": float(getattr(ev, "decay", 0.040)),
+        "sustain": float(getattr(ev, "sustain", 0.80)),
+        "sustain_level": float(getattr(ev, "sustain", 0.80)),
+        "release": float(getattr(ev, "release", 0.080)),
+        "release_s": float(getattr(ev, "release", 0.080)),
+
         "track_index": int(track_i),
         "track_name": str(track_name),
         "note_index": int(note_i),
@@ -1092,8 +1284,10 @@ def _render_python_instrument_track(
         voice_specs: List[Tuple[BaseBlock, Dict[str, Any], str, int, float]] = []
         max_voice_n = 0
 
+        attack_s, decay_s, sustain_level, release_s = _note_adsr_values(ev)
+
         for inst_i, (gen, p, name) in enumerate(inst_gens):
-            tail_s = _instrument_tail_seconds(p)
+            tail_s = max(_instrument_tail_seconds(p), release_s)
             voice_s = float(max(0.001, hold_s + tail_s))
             voice_n = max(1, int(round(voice_s * int(snap.sr))))
             max_voice_n = max(max_voice_n, voice_n)
@@ -1160,6 +1354,19 @@ def _render_python_instrument_track(
                 y = padded
             elif y.shape[0] > max_voice_n:
                 y = y[:max_voice_n]
+
+            # Apply the selected note's own ADSR after instrument synthesis.
+            # Uses the C++ DLL when available so live playback/export do not
+            # spend time building and multiplying a Python envelope array.
+            y = _apply_note_adsr_native_or_python(
+                y,
+                int(snap.sr),
+                hold_s=hold_s,
+                attack=attack_s,
+                decay=decay_s,
+                sustain=sustain_level,
+                release=release_s,
+            )
 
             # Layer headroom. More instruments should sound layered, not clipped.
             layer_gain = 1.0 / math.sqrt(max(1, len(inst_gens)))
@@ -1301,6 +1508,11 @@ def _render_snapshot(
     # Export/full render should preserve instrument release and FX tails.
     # Preview windows still stay capped by max_samples for responsiveness.
     tail_s = float(common.get("render_tail_seconds", 0.75))
+
+    for track_notes in snap.notes:
+        for ev in track_notes:
+            _a, _d, _s, release_s = _note_adsr_values(ev)
+            tail_s = max(tail_s, release_s)
 
     for track in snap.tracks:
         for inst in track.instruments:
