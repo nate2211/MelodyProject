@@ -4,8 +4,10 @@ block_cipher = None
 
 a = Analysis(
     ['gui.py'],
-    pathex=['.'],  # include project root
-    binaries=[],
+    pathex=['.'],
+    binaries=[
+        ('MelodyProject.dll', '.'),  # include DLL beside bundled app at runtime
+    ],
     datas=[],
     hiddenimports=[
         'PyQt6.QtCore',
@@ -13,14 +15,13 @@ a = Analysis(
         'PyQt6.QtWidgets',
         'numpy',
         'sounddevice',
-        # dynamic/registered modules
         'sounds',
         'realism',
-        'melody_humanize',   # your local module; safe once hook is overridden
+        'melody_humanize',
         'pipeline',
         'gui',
     ],
-    hookspath=['pyi_hooks'],  # <-- create this folder + hook-humanize.py inside
+    hookspath=['pyi_hooks'],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
