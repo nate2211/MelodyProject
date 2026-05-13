@@ -627,10 +627,20 @@ def _apply_note_adsr_native_or_python(
     return (x * env[:, None]).astype(np.float32, copy=False)
 
 def _dc_block_stereo(x: np.ndarray, amount: float = 0.995) -> np.ndarray:
+    """
+    DC blocker. Signature is unchanged, but this now uses
+    NATIVE_DSP.dc_block() / mp_dc_block_stereo_f32 when available.
+    """
     y = ensure_stereo(x).astype(np.float32, copy=False)
 
     if y.shape[0] <= 1:
         return y
+
+    if NATIVE_DSP is not None and hasattr(NATIVE_DSP, "dc_block"):
+        try:
+            return NATIVE_DSP.dc_block(y, amount=float(amount))
+        except Exception:
+            pass
 
     amount = float(np.clip(amount, 0.90, 0.9999))
     out = np.empty_like(y, dtype=np.float32)
@@ -652,7 +662,6 @@ def _dc_block_stereo(x: np.ndarray, amount: float = 0.995) -> np.ndarray:
         y1_l, y1_r = yl, yr
 
     return out.astype(np.float32, copy=False)
-
 
 def _soft_saturate(x: np.ndarray, drive: float = 1.0, ceiling: float = 0.98) -> np.ndarray:
     y = ensure_stereo(x).astype(np.float32, copy=False)
@@ -692,6 +701,10 @@ def _onepole_lowpass_stereo(x: np.ndarray, sr: int, cutoff_hz: float, wet: float
 
 
 def _master_finish(x: np.ndarray, sr: int, *, common: Dict[str, Any]) -> np.ndarray:
+    """
+    Final master safety/polish. Signature is unchanged, but this now prefers
+    NATIVE_DSP.master_finish() / mp_master_finish_stereo_f32 when available.
+    """
     y = ensure_stereo(x).astype(np.float32, copy=False)
 
     if y.shape[0] <= 0:
@@ -701,12 +714,29 @@ def _master_finish(x: np.ndarray, sr: int, *, common: Dict[str, Any]) -> np.ndar
     master_drive = float(common.get("master_drive", 1.04))
     master_ceiling = float(common.get("master_ceiling", 0.98))
     master_lowpass_hz = float(common.get("master_lowpass_hz", 20500.0))
+    lowpass_wet = float(common.get("master_lowpass_wet", 0.35))
+    dc_amount = float(common.get("master_dc_amount", 0.995))
 
-    y = _dc_block_stereo(y)
+    if NATIVE_DSP is not None and hasattr(NATIVE_DSP, "master_finish"):
+        try:
+            return NATIVE_DSP.master_finish(
+                y,
+                sample_rate=int(sr),
+                master_gain=float(master_gain),
+                master_drive=float(master_drive),
+                master_ceiling=float(master_ceiling),
+                master_lowpass_hz=float(master_lowpass_hz),
+                lowpass_wet=float(lowpass_wet),
+                dc_amount=float(dc_amount),
+            )
+        except Exception:
+            pass
+
+    y = _dc_block_stereo(y, amount=dc_amount)
     y *= master_gain
 
     if master_lowpass_hz > 0:
-        y = _onepole_lowpass_stereo(y, int(sr), master_lowpass_hz, wet=0.35)
+        y = _onepole_lowpass_stereo(y, int(sr), master_lowpass_hz, wet=lowpass_wet)
 
     # Tiny glue stage. This makes layered synthetic sounds feel less separate
     # without killing the block-specific timbre.
@@ -1139,10 +1169,36 @@ class Sequence:
 # ============================================================================
 
 def _mix_into(dst: np.ndarray, src: np.ndarray, gain: float = 1.0, *, dst_offset: int = 0) -> np.ndarray:
+    """
+    Mix a stereo source into a stereo destination.
+
+    Signature is unchanged, but this now prefers the MelodyProject.dll
+    mp_mix_rendered_note_layer_stereo_f32 fast path when the wrapper exposes it.
+    """
     if dst.size == 0:
         return dst
 
     src = ensure_stereo(src)
+    dst_offset = int(dst_offset)
+
+    n = min(int(dst.shape[0]) - max(0, dst_offset), int(src.shape[0]))
+
+    if n <= 0:
+        return dst
+
+    if NATIVE_DSP is not None and hasattr(NATIVE_DSP, "mix_rendered_note_layer"):
+        try:
+            return NATIVE_DSP.mix_rendered_note_layer(
+                dst,
+                src,
+                dst_offset=int(dst_offset),
+                src_offset=0,
+                frames_to_mix=int(n),
+                gain=float(gain),
+            )
+        except Exception:
+            pass
+
     dst_offset = int(max(0, dst_offset))
 
     if dst_offset >= dst.shape[0]:
@@ -1154,7 +1210,6 @@ def _mix_into(dst: np.ndarray, src: np.ndarray, gain: float = 1.0, *, dst_offset
         dst[dst_offset:dst_offset + n] += src[:n] * float(gain)
 
     return dst
-
 
 def _make_note_payload(
     snap: SequenceSnapshot,
@@ -1221,6 +1276,228 @@ def _make_note_payload(
         "seed": int(render_seed),
         "phase_seed": int(render_seed),
     }
+
+
+
+_NATIVE_SYNTH_ADSR_NAMES = {
+    "synth_keys",
+    "basic_synth",
+    "oscillator",
+    "piano_key",
+    "piano_keys",
+}
+
+_NATIVE_SYNTH_ADSR_ALLOWED_PARAMS = {
+    "wave",
+    "waveform",
+    "amp",
+    "gain",
+    "master_gain",
+    "pan",
+    "native_fast_path",
+}
+
+
+def _native_method_available(name: str) -> bool:
+    if NATIVE_DSP is None:
+        return False
+    if not hasattr(NATIVE_DSP, name):
+        return False
+    try:
+        return bool(getattr(NATIVE_DSP, "available", True))
+    except Exception:
+        return True
+
+
+def _param_bool(params: Dict[str, Any], name: str, default: bool = False) -> bool:
+    if name not in params:
+        return bool(default)
+
+    value = params.get(name)
+
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+    return bool(value)
+
+
+def _native_synth_param_is_simple(key: str, value: Any) -> bool:
+    k = str(key).strip().lower()
+
+    if k in _NATIVE_SYNTH_ADSR_ALLOWED_PARAMS:
+        return True
+
+    # These are common richer synth params. If they are unset/neutral, the
+    # native single-oscillator path is still faithful enough; if they are active,
+    # we keep the Python block path so the sound does not change unexpectedly.
+    neutral_zero = {
+        "unison",
+        "detune",
+        "detune_cents",
+        "chorus",
+        "chorus_mix",
+        "reverb_mix",
+        "noise",
+        "noise_mix",
+        "vibrato",
+        "vibrato_depth",
+        "filter_drive",
+        "drive",
+        "warmth",
+    }
+
+    if k in neutral_zero:
+        try:
+            if k == "unison":
+                return int(value) <= 1
+            return abs(float(value)) <= 1.0e-8
+        except Exception:
+            return False
+
+    # Attack/release on the instrument is ignored by the native per-note ADSR
+    # path because the selected NoteEvent owns the note envelope.
+    if k in {"attack", "decay", "sustain", "release", "attack_s", "decay_s", "release_s"}:
+        return True
+
+    # Metadata added by normalization/rendering is not part of tone design.
+    if k in {
+        "sr", "sample_rate", "preview", "track_index", "track_name",
+        "block_index", "block_kind", "render_seed", "window_start_sample",
+        "seed", "note_seed", "note_index", "instrument_index",
+    }:
+        return True
+
+    return False
+
+
+def _track_can_use_native_synth_adsr(track: Track) -> bool:
+    if not _native_method_available("render_synth_notes_adsr"):
+        return False
+
+    instruments = list(track.instruments) or [BlockInstance("synth_keys", {})]
+
+    if len(instruments) != 1:
+        return False
+
+    inst = instruments[0]
+    name = str(inst.name).strip().lower()
+
+    if name not in _NATIVE_SYNTH_ADSR_NAMES:
+        return False
+
+    params = dict(inst.params or {})
+
+    if _param_bool(params, "native_fast_path", True) is False:
+        return False
+
+    for k, v in params.items():
+        if not _native_synth_param_is_simple(k, v):
+            return False
+
+    return True
+
+
+def _render_native_synth_adsr_track(
+    snap: SequenceSnapshot,
+    track: Track,
+    notes: Tuple[NoteEvent, ...],
+    *,
+    track_i: int,
+    start_sample: int,
+    window_n: int,
+    step_s: float,
+    step_n: int,
+    total_n: int,
+    preview: bool,
+) -> np.ndarray:
+    """
+    Native batched synth + per-note ADSR path.
+
+    This keeps the existing render signatures, but when the track is a simple
+    synth track it sends arrays of all notes to MelodyProject.dll in one call:
+    mp_render_synth_notes_adsr_stereo_f32.
+    """
+    instruments = list(track.instruments) or [BlockInstance("synth_keys", {})]
+    inst = instruments[0]
+    p = dict(inst.params or {})
+
+    waveform = p.get("wave", p.get("waveform", "sine"))
+    gain = _safe_gain(p.get("amp", p.get("gain", p.get("master_gain", 0.22))), 0.22)
+    pan = float(np.clip(float(p.get("pan", 0.0)), -1.0, 1.0))
+
+    midi_notes: List[int] = []
+    start_frames: List[int] = []
+    length_frames: List[int] = []
+    velocities: List[float] = []
+    attacks: List[float] = []
+    decays: List[float] = []
+    sustains: List[float] = []
+    releases: List[float] = []
+
+    for ev in notes:
+        note_start_abs = int(ev.start_step) * step_n
+        hold_n = max(1, int(ev.length_steps) * step_n)
+        attack_s, decay_s, sustain_level, release_s = _note_adsr_values(ev)
+        release_n = int(round(max(0.0, release_s) * int(snap.sr)))
+        note_end_abs = note_start_abs + hold_n + release_n
+
+        if note_end_abs <= start_sample or note_start_abs >= start_sample + window_n:
+            continue
+
+        note, octv = ev.pitch
+
+        try:
+            midi = midi_from_note(note, octv)
+        except Exception:
+            continue
+
+        midi_notes.append(int(midi))
+        start_frames.append(int(note_start_abs - start_sample))
+        length_frames.append(int(hold_n))
+        velocities.append(float(np.clip(float(ev.velocity), 0.0, 2.0)))
+        attacks.append(float(attack_s))
+        decays.append(float(decay_s))
+        sustains.append(float(sustain_level))
+        releases.append(float(release_s))
+
+    if not midi_notes:
+        return np.zeros((window_n, 2), dtype=np.float32)
+
+    try:
+        out = NATIVE_DSP.render_synth_notes_adsr(
+            np.asarray(midi_notes, dtype=np.int32),
+            np.asarray(start_frames, dtype=np.int32),
+            np.asarray(length_frames, dtype=np.int32),
+            np.asarray(velocities, dtype=np.float32),
+            np.asarray(attacks, dtype=np.float32),
+            np.asarray(decays, dtype=np.float32),
+            np.asarray(sustains, dtype=np.float32),
+            np.asarray(releases, dtype=np.float32),
+            total_frames=int(window_n),
+            sample_rate=int(snap.sr),
+            waveform=waveform,
+            master_gain=float(gain),
+            pan=float(pan),
+            clear_output=True,
+        )
+    except Exception as exc:
+        print(f"[pipeline] native synth ADSR fast path failed on track '{track.name}': {exc}")
+        return _render_python_instrument_track(
+            snap,
+            track,
+            notes,
+            track_i=track_i,
+            start_sample=start_sample,
+            window_n=window_n,
+            step_s=step_s,
+            step_n=step_n,
+            total_n=total_n,
+            preview=preview,
+        )
+
+    out = _dc_block_stereo(out)
+    out = sanitize_audio(out, ceiling=1.25)
+    return out.astype(np.float32, copy=False)
 
 
 def _render_python_instrument_track(
@@ -1413,18 +1690,32 @@ def _render_dry_track(
     if cached is not None:
         return cached
 
-    out = _render_python_instrument_track(
-        snap,
-        track,
-        notes,
-        track_i=track_i,
-        start_sample=start_sample,
-        window_n=window_n,
-        step_s=step_s,
-        step_n=step_n,
-        total_n=total_n,
-        preview=preview,
-    )
+    if _track_can_use_native_synth_adsr(track):
+        out = _render_native_synth_adsr_track(
+            snap,
+            track,
+            notes,
+            track_i=track_i,
+            start_sample=start_sample,
+            window_n=window_n,
+            step_s=step_s,
+            step_n=step_n,
+            total_n=total_n,
+            preview=preview,
+        )
+    else:
+        out = _render_python_instrument_track(
+            snap,
+            track,
+            notes,
+            track_i=track_i,
+            start_sample=start_sample,
+            window_n=window_n,
+            step_s=step_s,
+            step_n=step_n,
+            total_n=total_n,
+            preview=preview,
+        )
 
     _cache_put(key, out)
     return out

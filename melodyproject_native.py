@@ -143,7 +143,194 @@ def _python_render_synth_notes(
         out[dst_a:dst_b, 0] += sample * left_gain
         out[dst_a:dst_b, 1] += sample * right_gain
 
+
     return out.astype(np.float32, copy=False)
+
+
+
+def _adsr_held_value_py(
+    i: int,
+    frames: int,
+    hold_frames: int,
+    sample_rate: int,
+    attack: float,
+    decay: float,
+    sustain: float,
+    release: float,
+    curve: float = 1.0,
+) -> float:
+    if frames <= 0:
+        return 0.0
+
+    sample_rate = int(max(1, sample_rate))
+    hold_frames = int(max(1, min(int(frames), int(hold_frames))))
+    attack = max(0.0, float(attack))
+    decay = max(0.0, float(decay))
+    sustain = float(np.clip(float(sustain), 0.0, 2.0))
+    release = max(0.0, float(release))
+    curve = float(np.clip(float(curve), 0.15, 2.5))
+
+    attack_n = max(0, int(round(attack * sample_rate)))
+    decay_n = max(0, int(round(decay * sample_rate)))
+    release_n = max(0, int(round(release * sample_rate)))
+
+    if attack_n + decay_n > hold_frames:
+        total = max(1, attack_n + decay_n)
+        scale = float(hold_frames) / float(total)
+        attack_n = int(round(attack_n * scale))
+        decay_n = max(0, hold_frames - attack_n)
+
+    def hold_env_at(j: int) -> float:
+        j = int(max(0, min(hold_frames - 1, int(j))))
+        if attack_n == 0 and decay_n == 0:
+            return float(max(sustain, 1.0)) if j == 0 else float(sustain)
+        if attack_n > 0 and j < attack_n:
+            x = float(np.clip(j / float(max(1, attack_n)), 0.0, 1.0))
+            return float(np.clip(x ** (1.0 / curve), 0.0, 2.0))
+        if decay_n > 0 and j < attack_n + decay_n:
+            x = float(np.clip((j - attack_n) / float(max(1, decay_n)), 0.0, 1.0))
+            shaped = x ** curve
+            return float(np.clip(1.0 + (sustain - 1.0) * shaped, 0.0, 2.0))
+        return float(sustain)
+
+    if i < 0 or i >= frames:
+        return 0.0
+    if i < hold_frames:
+        return hold_env_at(i)
+    if release_n > 0 and i < hold_frames + release_n:
+        x = float(np.clip((i - hold_frames) / float(max(1, release_n)), 0.0, 1.0))
+        return float(np.clip(hold_env_at(hold_frames - 1) * ((1.0 - x) ** (1.0 / curve)), 0.0, 2.0))
+    return 0.0
+
+
+def _python_render_synth_notes_adsr(
+    midi_notes: np.ndarray,
+    start_frames: np.ndarray,
+    length_frames: np.ndarray,
+    velocities: np.ndarray,
+    attacks: np.ndarray,
+    decays: np.ndarray,
+    sustains: np.ndarray,
+    releases: np.ndarray,
+    *,
+    total_frames: int,
+    sample_rate: int,
+    waveform: int,
+    master_gain: float,
+    pan: float,
+) -> np.ndarray:
+    total_frames = max(0, int(total_frames))
+    sample_rate = int(max(1, sample_rate))
+    out = np.zeros((total_frames, 2), dtype=np.float32)
+
+    if total_frames <= 0:
+        return out
+
+    pan = float(np.clip(pan, -1.0, 1.0))
+    left_gain = 1.0 if pan <= 0.0 else 1.0 - pan
+    right_gain = 1.0 if pan >= 0.0 else 1.0 + pan
+
+    count = min(
+        len(midi_notes), len(start_frames), len(length_frames), len(velocities),
+        len(attacks), len(decays), len(sustains), len(releases),
+    )
+
+    for note_i in range(count):
+        midi = int(midi_notes[note_i])
+        if midi < 0 or midi > 127:
+            continue
+
+        note_start = int(start_frames[note_i])
+        hold_frames = max(1, int(length_frames[note_i]))
+        release_frames = max(0, int(round(max(0.0, float(releases[note_i])) * sample_rate)))
+        render_frames = max(1, hold_frames + release_frames)
+        note_end = note_start + render_frames
+
+        if note_end <= 0 or note_start >= total_frames:
+            continue
+
+        dst_a = max(0, note_start)
+        dst_b = min(total_frames, note_end)
+        if dst_b <= dst_a:
+            continue
+
+        local = np.arange(dst_a - note_start, dst_b - note_start, dtype=np.float64)
+        freq = 440.0 * (2.0 ** ((float(midi) - 69.0) / 12.0))
+        phase = local * (freq / float(sample_rate))
+        env = np.asarray([
+            _adsr_held_value_py(
+                int(i), render_frames, hold_frames, sample_rate,
+                float(attacks[note_i]), float(decays[note_i]), float(sustains[note_i]), float(releases[note_i]), 1.0,
+            )
+            for i in local
+        ], dtype=np.float32)
+        sample = (
+            _wave_sample(waveform, phase)
+            * float(np.clip(velocities[note_i], 0.0, 2.0))
+            * float(master_gain)
+            * env
+        )
+        out[dst_a:dst_b, 0] += sample * left_gain
+        out[dst_a:dst_b, 1] += sample * right_gain
+
+    return out.astype(np.float32, copy=False)
+
+
+def _python_dc_block(audio: np.ndarray, *, amount: float = 0.995) -> np.ndarray:
+    x = ensure_stereo(audio).copy()
+    if x.shape[0] <= 1:
+        return x
+
+    amount = float(np.clip(float(amount), 0.90, 0.9999))
+    out = np.empty_like(x, dtype=np.float32)
+    x1_l = x1_r = 0.0
+    y1_l = y1_r = 0.0
+
+    for i in range(x.shape[0]):
+        xl = float(x[i, 0])
+        xr = float(x[i, 1])
+        yl = xl - x1_l + amount * y1_l
+        yr = xr - x1_r + amount * y1_r
+        out[i, 0] = yl
+        out[i, 1] = yr
+        x1_l, x1_r = xl, xr
+        y1_l, y1_r = yl, yr
+
+    return out.astype(np.float32, copy=False)
+
+
+def _python_master_finish(
+    audio: np.ndarray,
+    *,
+    sample_rate: int,
+    master_gain: float = 1.0,
+    master_drive: float = 1.04,
+    master_ceiling: float = 0.98,
+    master_lowpass_hz: float = 20500.0,
+    lowpass_wet: float = 0.35,
+    dc_amount: float = 0.995,
+) -> np.ndarray:
+    x = _python_dc_block(audio, amount=dc_amount)
+    if x.size == 0:
+        return x
+
+    x = (x * float(master_gain)).astype(np.float32, copy=False)
+
+    if float(master_lowpass_hz) > 0.0 and float(lowpass_wet) > 1.0e-8:
+        x = _python_lowpass(
+            x,
+            sample_rate=int(sample_rate),
+            cutoff_hz=float(master_lowpass_hz),
+            wet=float(lowpass_wet),
+        )
+
+    drive = float(np.clip(master_drive, 0.05, 20.0))
+    ceiling = float(np.clip(master_ceiling, 0.05, 1.0))
+    y = np.tanh(x * (0.30 + drive ** 1.10)).astype(np.float32, copy=False)
+    mx = float(np.max(np.abs(y))) if y.size else 0.0
+    if mx > ceiling and mx > 1.0e-12:
+        y *= ceiling / mx
+    return np.clip(y, -ceiling, ceiling).astype(np.float32, copy=False)
 
 
 
@@ -323,6 +510,10 @@ class MelodyProjectNative:
         self.available: bool = False
         self.native_sounds_available: bool = False
         self.note_envelope_available: bool = False
+        self.synth_adsr_available: bool = False
+        self.dc_block_available: bool = False
+        self.master_finish_available: bool = False
+        self.mix_rendered_layer_available: bool = False
         self.version: Optional[int] = None
         self.lib: Optional[ctypes.CDLL] = None
         self._lock = threading.RLock()
@@ -452,6 +643,51 @@ class MelodyProjectNative:
                     lib,
                     "mp_apply_note_adsr_stereo_f32",
                     [C_FLOAT_P, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float],
+                    ctypes.c_int,
+                )
+
+                self.synth_adsr_available = self._bind_optional(
+                    lib,
+                    "mp_render_synth_notes_adsr_stereo_f32",
+                    [
+                        C_INT_P,
+                        C_INT_P,
+                        C_INT_P,
+                        C_FLOAT_P,
+                        C_FLOAT_P,
+                        C_FLOAT_P,
+                        C_FLOAT_P,
+                        C_FLOAT_P,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_int,
+                        ctypes.c_float,
+                        ctypes.c_float,
+                        ctypes.c_int,
+                        C_FLOAT_P,
+                    ],
+                    ctypes.c_int,
+                )
+
+                self.dc_block_available = self._bind_optional(
+                    lib,
+                    "mp_dc_block_stereo_f32",
+                    [C_FLOAT_P, ctypes.c_int, ctypes.c_float],
+                    ctypes.c_int,
+                )
+
+                self.master_finish_available = self._bind_optional(
+                    lib,
+                    "mp_master_finish_stereo_f32",
+                    [C_FLOAT_P, ctypes.c_int, ctypes.c_int, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float],
+                    ctypes.c_int,
+                )
+
+                self.mix_rendered_layer_available = self._bind_optional(
+                    lib,
+                    "mp_mix_rendered_note_layer_stereo_f32",
+                    [C_FLOAT_P, ctypes.c_int, C_FLOAT_P, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float],
                     ctypes.c_int,
                 )
 
@@ -614,6 +850,10 @@ class MelodyProjectNative:
         self.available = False
         self.native_sounds_available = False
         self.note_envelope_available = False
+        self.synth_adsr_available = False
+        self.dc_block_available = False
+        self.master_finish_available = False
+        self.mix_rendered_layer_available = False
         self.load_error = last_error or "MelodyProject.dll not found"
 
     def status(self) -> Dict[str, Any]:
@@ -622,6 +862,10 @@ class MelodyProjectNative:
             "available": bool(self.available),
             "native_sounds_available": bool(self.native_sounds_available),
             "note_envelope_available": bool(self.note_envelope_available),
+            "synth_adsr_available": bool(self.synth_adsr_available),
+            "dc_block_available": bool(self.dc_block_available),
+            "master_finish_available": bool(self.master_finish_available),
+            "mix_rendered_layer_available": bool(self.mix_rendered_layer_available),
             "dll_path": self.dll_path,
             "load_error": self.load_error,
             "version": self.version,
@@ -853,6 +1097,218 @@ class MelodyProjectNative:
         )
 
         return out
+
+    def render_synth_notes_adsr(
+        self,
+        midi_notes: np.ndarray,
+        start_frames: np.ndarray,
+        length_frames: np.ndarray,
+        velocities: np.ndarray,
+        attacks: np.ndarray,
+        decays: np.ndarray,
+        sustains: np.ndarray,
+        releases: np.ndarray,
+        *,
+        total_frames: int,
+        sample_rate: int,
+        waveform: int | str = MP_WAVE_SINE,
+        master_gain: float = 0.22,
+        pan: float = 0.0,
+        clear_output: bool = True,
+    ) -> np.ndarray:
+        total_frames = max(0, int(total_frames))
+        out = np.zeros((total_frames, 2), dtype=np.float32)
+
+        if total_frames <= 0:
+            return out
+
+        midi = np.ascontiguousarray(midi_notes, dtype=np.int32)
+        starts = np.ascontiguousarray(start_frames, dtype=np.int32)
+        lengths = np.ascontiguousarray(length_frames, dtype=np.int32)
+        vels = np.ascontiguousarray(velocities, dtype=np.float32)
+        atk = np.ascontiguousarray(attacks, dtype=np.float32)
+        dec = np.ascontiguousarray(decays, dtype=np.float32)
+        sus = np.ascontiguousarray(sustains, dtype=np.float32)
+        rel = np.ascontiguousarray(releases, dtype=np.float32)
+
+        note_count = int(min(
+            midi.shape[0], starts.shape[0], lengths.shape[0], vels.shape[0],
+            atk.shape[0], dec.shape[0], sus.shape[0], rel.shape[0],
+        ))
+
+        if note_count <= 0:
+            return out
+
+        midi = midi[:note_count]
+        starts = starts[:note_count]
+        lengths = lengths[:note_count]
+        vels = vels[:note_count]
+        atk = atk[:note_count]
+        dec = dec[:note_count]
+        sus = sus[:note_count]
+        rel = rel[:note_count]
+
+        wf = waveform_id(waveform)
+
+        if not self._has("mp_render_synth_notes_adsr_stereo_f32"):
+            return _python_render_synth_notes_adsr(
+                midi,
+                starts,
+                lengths,
+                vels,
+                atk,
+                dec,
+                sus,
+                rel,
+                total_frames=total_frames,
+                sample_rate=int(sample_rate),
+                waveform=wf,
+                master_gain=float(master_gain),
+                pan=float(pan),
+            )
+
+        self._check(
+            self.lib.mp_render_synth_notes_adsr_stereo_f32(
+                self._int_ptr(midi),
+                self._int_ptr(starts),
+                self._int_ptr(lengths),
+                self._float_ptr(vels),
+                self._float_ptr(atk),
+                self._float_ptr(dec),
+                self._float_ptr(sus),
+                self._float_ptr(rel),
+                ctypes.c_int(note_count),
+                ctypes.c_int(total_frames),
+                ctypes.c_int(int(sample_rate)),
+                ctypes.c_int(wf),
+                ctypes.c_float(float(master_gain)),
+                ctypes.c_float(float(pan)),
+                ctypes.c_int(1 if clear_output else 0),
+                self._float_ptr(out),
+            )
+        )
+
+        return out
+
+    def dc_block(self, audio: np.ndarray, *, amount: float = 0.995) -> np.ndarray:
+        x = ensure_stereo(audio).copy()
+
+        if x.size == 0:
+            return x
+
+        if not self._has("mp_dc_block_stereo_f32"):
+            return _python_dc_block(x, amount=float(amount))
+
+        self._check(
+            self.lib.mp_dc_block_stereo_f32(
+                self._float_ptr(x),
+                ctypes.c_int(int(x.shape[0])),
+                ctypes.c_float(float(amount)),
+            )
+        )
+
+        return x
+
+    def master_finish(
+        self,
+        audio: np.ndarray,
+        *,
+        sample_rate: int,
+        master_gain: float = 1.0,
+        master_drive: float = 1.04,
+        master_ceiling: float = 0.98,
+        master_lowpass_hz: float = 20500.0,
+        lowpass_wet: float = 0.35,
+        dc_amount: float = 0.995,
+    ) -> np.ndarray:
+        x = ensure_stereo(audio).copy()
+
+        if x.size == 0:
+            return x
+
+        if not self._has("mp_master_finish_stereo_f32"):
+            return _python_master_finish(
+                x,
+                sample_rate=int(sample_rate),
+                master_gain=float(master_gain),
+                master_drive=float(master_drive),
+                master_ceiling=float(master_ceiling),
+                master_lowpass_hz=float(master_lowpass_hz),
+                lowpass_wet=float(lowpass_wet),
+                dc_amount=float(dc_amount),
+            )
+
+        self._check(
+            self.lib.mp_master_finish_stereo_f32(
+                self._float_ptr(x),
+                ctypes.c_int(int(x.shape[0])),
+                ctypes.c_int(int(sample_rate)),
+                ctypes.c_float(float(master_gain)),
+                ctypes.c_float(float(master_drive)),
+                ctypes.c_float(float(master_ceiling)),
+                ctypes.c_float(float(master_lowpass_hz)),
+                ctypes.c_float(float(lowpass_wet)),
+                ctypes.c_float(float(dc_amount)),
+            )
+        )
+
+        return x
+
+    def mix_rendered_note_layer(
+        self,
+        dst: np.ndarray,
+        src: np.ndarray,
+        *,
+        dst_offset: int = 0,
+        src_offset: int = 0,
+        frames_to_mix: Optional[int] = None,
+        gain: float = 1.0,
+    ) -> np.ndarray:
+        d = ensure_stereo(dst)
+        s = ensure_stereo(src)
+
+        if d.size == 0 or s.size == 0:
+            return d
+
+        if frames_to_mix is None:
+            frames_to_mix = min(int(d.shape[0]) - int(dst_offset), int(s.shape[0]) - int(src_offset))
+
+        frames_to_mix = int(frames_to_mix)
+
+        if frames_to_mix <= 0:
+            return d
+
+        if not self._has("mp_mix_rendered_note_layer_stereo_f32"):
+            da = int(dst_offset)
+            sa = int(src_offset)
+            n = int(frames_to_mix)
+            if da < 0:
+                sa -= da
+                n += da
+                da = 0
+            if sa < 0:
+                da -= sa
+                n += sa
+                sa = 0
+            n = max(0, min(n, int(d.shape[0]) - da, int(s.shape[0]) - sa))
+            if n > 0:
+                d[da:da + n] += s[sa:sa + n] * float(gain)
+            return d
+
+        self._check(
+            self.lib.mp_mix_rendered_note_layer_stereo_f32(
+                self._float_ptr(d),
+                ctypes.c_int(int(d.shape[0])),
+                self._float_ptr(s),
+                ctypes.c_int(int(s.shape[0])),
+                ctypes.c_int(int(dst_offset)),
+                ctypes.c_int(int(src_offset)),
+                ctypes.c_int(int(frames_to_mix)),
+                ctypes.c_float(float(gain)),
+            )
+        )
+
+        return d
 
     def convolve(
         self,
